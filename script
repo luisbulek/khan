@@ -1,0 +1,324 @@
+
+```javascript
+// ==UserScript==
+// @name         KhanBypass Estavel - 2.8.2
+// @namespace    khan-stable
+// @version      2.8.2
+// @description  Painel de controles sem travamentos
+// @match        https://pt.khanacademy.org/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    "use strict";
+
+    if (window.__khanStableLoaded) return;
+    window.__khanStableLoaded = true;
+
+    const CONFIG = {
+        darkMode: false,
+        autoAdvance: false,
+        interval: 3000
+    };
+
+    let timer = null;
+    let lastClick = 0;
+
+    function log(message) {
+        console.log("[Khan Stable]", message);
+    }
+
+    function notify(message) {
+        const toast = document.createElement("div");
+        toast.textContent = message;
+
+        Object.assign(toast.style, {
+            position: "fixed",
+            bottom: "80px",
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "#163d2b",
+            color: "white",
+            padding: "12px 18px",
+            borderRadius: "10px",
+            zIndex: "2147483647",
+            fontFamily: "Arial",
+            fontSize: "13px"
+        });
+
+        document.body.appendChild(toast);
+
+        setTimeout(() => toast.remove(), 2500);
+    }
+
+    function safeClick(element) {
+        if (!element || !element.isConnected) {
+            return false;
+        }
+
+        if (element.disabled) return false;
+
+        if (element.getClientRects().length === 0) {
+            return false;
+        }
+
+        const now = Date.now();
+
+        if (now - lastClick < 2500) {
+            return false;
+        }
+
+        lastClick = now;
+        element.click();
+
+        return true;
+    }
+
+    function findButton() {
+        const selectors = [
+            '[data-testid="exercise-next-question"]',
+            'button[data-testid="exercise-next-question"]'
+        ];
+
+        for (const selector of selectors) {
+            const element = document.querySelector(selector);
+
+            if (element) return element;
+        }
+
+        const buttons = document.querySelectorAll("button");
+
+        for (const button of buttons) {
+            const text = button.textContent.trim().toLowerCase();
+
+            if (
+                text === "próxima questão" ||
+                text === "próximo" ||
+                text === "continuar"
+            ) {
+                return button;
+            }
+        }
+
+        return null;
+    }
+
+    function advanceOnce() {
+        const button = findButton();
+
+        if (!button) {
+            notify("Nenhum botão de avançar disponível.");
+            return false;
+        }
+
+        return safeClick(button);
+    }
+
+    function stopAutomation() {
+        CONFIG.autoAdvance = false;
+
+        if (timer !== null) {
+            clearInterval(timer);
+            timer = null;
+        }
+
+        log("Automação interrompida.");
+    }
+
+    function startAutomation() {
+        if (timer !== null) return;
+
+        CONFIG.autoAdvance = true;
+
+        timer = setInterval(() => {
+            if (!CONFIG.autoAdvance) return;
+
+            if (document.visibilityState !== "visible") {
+                return;
+            }
+
+            try {
+                const button = findButton();
+
+                if (button) safeClick(button);
+            } catch (error) {
+                console.error("[Khan Stable]", error);
+                stopAutomation();
+            }
+
+        }, CONFIG.interval);
+
+        log("Auto-avançar ativado.");
+    }
+
+    function toggleDarkMode() {
+        let style = document.getElementById("kb-dark-style");
+
+        if (style) {
+            style.remove();
+            CONFIG.darkMode = false;
+            notify("Modo escuro desativado.");
+            return;
+        }
+
+        style = document.createElement("style");
+        style.id = "kb-dark-style";
+
+        style.textContent = `
+            html {
+                filter: invert(1) hue-rotate(180deg);
+                background: #111;
+            }
+
+            img, video, canvas, svg {
+                filter: invert(1) hue-rotate(180deg);
+            }
+        `;
+
+        document.head.appendChild(style);
+        CONFIG.darkMode = true;
+
+        notify("Modo escuro ativado.");
+    }
+
+    function createPanel() {
+        if (document.getElementById("kb-toggle")) return;
+
+        const toggle = document.createElement("button");
+        toggle.id = "kb-toggle";
+        toggle.textContent = "KB";
+
+        Object.assign(toggle.style, {
+            position: "fixed",
+            right: "20px",
+            bottom: "20px",
+            width: "52px",
+            height: "52px",
+            borderRadius: "50%",
+            background: "#13a66b",
+            color: "white",
+            border: "none",
+            fontWeight: "bold",
+            fontSize: "16px",
+            cursor: "pointer",
+            zIndex: "2147483646"
+        });
+
+        const panel = document.createElement("div");
+
+        Object.assign(panel.style, {
+            position: "fixed",
+            right: "20px",
+            bottom: "85px",
+            width: "250px",
+            padding: "16px",
+            borderRadius: "14px",
+            background: "#17241d",
+            color: "white",
+            display: "none",
+            zIndex: "2147483646",
+            fontFamily: "Arial",
+            boxShadow: "0 4px 20px #0006"
+        });
+
+        const title = document.createElement("h3");
+        title.textContent = "KHAN STABLE 2.8.2";
+        title.style.margin = "0 0 15px";
+
+        panel.appendChild(title);
+
+        function makeButton(text, action) {
+            const button = document.createElement("button");
+            button.textContent = text;
+
+            Object.assign(button.style, {
+                display: "block",
+                width: "100%",
+                marginBottom: "9px",
+                padding: "11px",
+                background: "#28533c",
+                border: "1px solid #347b57",
+                borderRadius: "8px",
+                color: "white",
+                cursor: "pointer",
+                textAlign: "left"
+            });
+
+            button.addEventListener("click", action);
+            panel.appendChild(button);
+
+            return button;
+        }
+
+        const autoButton = makeButton(
+            "Auto-avançar: OFF",
+            () => {
+                if (CONFIG.autoAdvance) {
+                    stopAutomation();
+                } else {
+                    startAutomation();
+                }
+
+                autoButton.textContent =
+                    CONFIG.autoAdvance
+                    ? "Auto-avançar: ON"
+                    : "Auto-avançar: OFF";
+            }
+        );
+
+        makeButton("Avançar uma vez", advanceOnce);
+
+        makeButton("Alternar modo escuro", toggleDarkMode);
+
+        makeButton("Parar automação", () => {
+            stopAutomation();
+            autoButton.textContent = "Auto-avançar: OFF";
+            notify("Automação parada.");
+        });
+
+        const description = document.createElement("p");
+        description.textContent =
+            "Controles experimentais. Nenhuma alteração de respostas ou progresso.";
+        description.style.fontSize = "11px";
+        description.style.color = "#b7cfc0";
+
+        panel.appendChild(description);
+
+        toggle.addEventListener("click", () => {
+            panel.style.display =
+                panel.style.display === "none"
+                ? "block"
+                : "none";
+        });
+
+        document.body.appendChild(panel);
+        document.body.appendChild(toggle);
+
+        log("Painel carregado.");
+    }
+
+    function initialize() {
+        try {
+            createPanel();
+            log("Khan Stable iniciado.");
+            notify("Khan Stable 2.8.2 carregado!");
+        } catch (error) {
+            console.error("[Khan Stable] Falha:", error);
+        }
+    }
+
+    if (document.readyState === "loading") {
+        document.addEventListener(
+            "DOMContentLoaded",
+            initialize,
+            { once: true }
+        );
+    } else {
+        initialize();
+    }
+
+    window.addEventListener("pagehide", stopAutomation);
+
+})();
+```
