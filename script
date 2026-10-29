@@ -1,9 +1,10 @@
 
  // ==UserScript==
- // @name         Khan Stable - LuisBulek 2.9.0
+ // @name         KhanBypass - LuisBulek 3.1 (estavel)
  // @namespace    https://github.com/luisbulek/khan
- // @version      2.9.0
- // @description  Reordena alternativas identificadas e avanca somente apos acerto confirmado
+ // @version      3.1.0
+ // @description  Atualizacao experimental do KhanBypass v2.7: alternativa A e avancar apenas apos acerto real.
+ // @author       mzzvxm (original); adaptacao LuisBulek
  // @match        https://*.khanacademy.org/*
  // @match        https://khanacademy.org/*
  // @run-at       document-start
@@ -12,345 +13,376 @@
 
 (() => {
   'use strict';
-  if (window.__LB_KHAN_290__) return;
-  window.__LB_KHAN_290__ = true;
 
-  const ID = 'lb-khan-290';
+  const KEY = '__LB_KHAN_V31__';
+  if (window[KEY]) return;
+  window[KEY] = true;
+
+  const NAME = '[KhanBypass 3.1]';
   const state = {
-    active: true,
-    phase: 'idle',
-    itemId: null,
-    since: Date.now(),
-    message: 'Aguardando uma nova questao...'
+    enabled: true,
+    phase: 'waiting',
+    pending: [],
+    ids: new Set(),
+    lastScreen: null,
+    lastAction: 0,
+    phaseSince: Date.now(),
+    message: 'Aguardando dados de uma nova questão.',
+    patched: 0,
+    errors: 0
   };
-  let statusNode = null;
-  let toggleNode = null;
-  let lastAction = 0;
+
   const originalFetch = window.fetch;
+  const log = (...args) => console.info(NAME, ...args);
 
   function report(message) {
     state.message = message;
-    console.info('[Khan Stable]', message);
-    if (statusNode) statusNode.textContent = message;
-    if (toggleNode) toggleNode.textContent =
-      state.active ? 'Pausar' : 'Iniciar';
+    log(message);
+    const node = document.getElementById('lb-status');
+    if (node) node.textContent = message;
+    const count = document.getElementById('lb-count');
+    if (count) count.textContent = 'Questões preparadas: ' + state.patched;
+    const toggle = document.getElementById('lb-toggle');
+    if (toggle) toggle.textContent = state.enabled ? 'Pausar' : 'Ativar';
   }
 
-  function visible(el) {
-    return Boolean(el && el.isConnected && !el.disabled &&
-      el.getAttribute('aria-disabled') !== 'true' &&
-      el.getClientRects().length);
+  function setPhase(phase, message) {
+    state.phase = phase;
+    state.phaseSince = Date.now();
+    if (message) report(message);
   }
 
-  function buttonByTestId(ids) {
-    for (const id of ids) {
-      const btn = document.querySelector(
-        `[data-testid="${id}"]`
-      );
-      if (visible(btn)) return btn;
-    }
-    return null;
+  function visible(element) {
+    return !!(element && element.isConnected && !element.disabled &&
+      element.getAttribute('aria-disabled') !== 'true' &&
+      element.getClientRects().length);
   }
 
-  function buttonByText(values) {
-    const allowed = new Set(values);
-    return [...document.querySelectorAll('button')].find(el =>
-      visible(el) &&
-      allowed.has((el.textContent || '').trim().toLowerCase())
-    ) || null;
+  function widgetMentioned(content, key) {
+    return typeof content === 'string' &&
+      content.includes('☃ ' + key);
   }
 
-  function checkButton() {
-    return buttonByTestId(['exercise-check-answer']) ||
-      buttonByText([
-        'verificar',
-        'verificar resposta',
-        'check answer'
-      ]);
+  // Reaproveita o processamento de widgets do original, mas sem fabricar
+  // respostas na requisicao attemptProblem nem substituir a pergunta.
+  function patchItemData(raw, itemId) {
+    const data = JSON.parse(raw);
+    const question = data?.question;
+    const widgets = question?.widgets;
+    if (!widgets || typeof widgets !== 'object') return null;
+
+    const entries = Object.entries(widgets).filter(([key]) =>
+      widgetMentioned(question.content, key)
+    );
+    // Alguns exercicios nao usam marcador no enunciado.
+    const active = entries.length ? entries : Object.entries(widgets);
+    if (active.length !== 1) return null;
+
+    const [widgetKey, widget] = active[0];
+    if (widget?.type !== 'radio') return null;
+    const options = widget.options;
+    if (!options || options.multipleSelect || !Array.isArray(options.choices)) return null;
+    const choices = options.choices;
+    if (choices.length < 2) return null;
+    const correctIndexes = choices
+      .map((choice, index) => choice?.correct === true ? index : -1)
+      .filter(index => index >= 0);
+    if (correctIndexes.length !== 1) return null;
+
+    const index = correctIndexes[0];
+    // Mantem IDs originais, pois a validacao e feita pela plataforma.
+    const sorted = [choices[index], ...choices.filter((_, i) => i !== index)];
+    options.choices = sorted;
+    options.randomize = false;
+    return {
+      raw: JSON.stringify(data),
+      id: String(itemId || 'sem-id-' + Date.now()),
+      correctText: String(choices[index]?.content || ''),
+      key: widgetKey
+    };
   }
 
-  function nextButton() {
-    return buttonByTestId([
-      'exercise-next-question',
-      'exercise-next-question-button'
-    ]) || buttonByText([
-      'próxima questão',
-      'proxima questao',
-      'próxima pergunta',
-      'proxima pergunta',
-      'next question'
-    ]);
-  }
+  function modifyAssessment(data) {
+    let modified = 0;
+    const roots = Array.isArray(data) ? data : [data];
+    const visited = new WeakSet();
 
-  function findQuestionItem(payload) {
-    if (!payload || !payload.data) return null;
-    for (const section of Object.values(payload.data)) {
-      if (section && section.item &&
-          typeof section.item.itemData === 'string') {
-        return section.item;
+    function visit(node, depth) {
+      if (!node || typeof node !== 'object' || depth > 9 || visited.has(node)) return;
+      visited.add(node);
+      if (typeof node.itemData === 'string') {
+        try {
+          const result = patchItemData(node.itemData, node.id || node.assessmentItemId);
+          if (result) {
+            node.itemData = result.raw;
+            modified++;
+            if (!state.ids.has(result.id)) {
+              state.ids.add(result.id);
+              state.pending.push(result);
+            }
+          }
+        } catch (error) {
+          console.warn(NAME, 'Dados de questão ignorados:', error);
+        }
       }
+      for (const value of Object.values(node)) visit(value, depth + 1);
+    }
+    for (const root of roots) visit(root, 0);
+    return modified;
+  }
+
+  function getVerdict(data) {
+    const roots = Array.isArray(data) ? data : [data];
+    for (const root of roots) {
+      const result = root?.data?.attemptProblem?.result;
+      const verdict = result?.actionResults?.attemptCorrect ?? result?.attemptCorrect;
+      if (typeof verdict === 'boolean') return verdict;
     }
     return null;
   }
 
-  function prepareAssessment(payload) {
-    const item = findQuestionItem(payload);
-    if (!item) return false;
-
-    let data;
-    try {
-      data = JSON.parse(item.itemData);
-    } catch {
-      return false;
-    }
-
-    const question = data && data.question;
-    if (!question ||
-        typeof question.content !== 'string' ||
-        !question.widgets) {
-      return false;
-    }
-
-    const used = Object.entries(question.widgets)
-      .filter(([key]) =>
-        question.content.includes('☃ ' + key)
-      );
-
-    if (used.length !== 1 ||
-        used[0][1].type !== 'radio') {
-      state.phase = 'unsupported';
-      report('Questao nao compativel: nenhum clique automatico.');
-      return false;
-    }
-
-    const widget = used[0][1];
-    const choices = widget.options && widget.options.choices;
-
-    if (!Array.isArray(choices) ||
-        choices.length < 2 ||
-        widget.options.multipleSelect ||
-        choices.filter(c => c.correct === true).length !== 1) {
-      state.phase = 'unsupported';
-      report('Resposta correta nao disponivel; automacao parada nesta questao.');
-      return false;
-    }
-
-    const correctIndex = choices.findIndex(
-      choice => choice.correct === true
-    );
-
-    const reordered = [
-      choices[correctIndex],
-      ...choices.filter((_, index) => index !== correctIndex)
-    ];
-
-    widget.options.choices = reordered;
-    widget.options.randomize = false;
-    item.itemData = JSON.stringify(data);
-
-    state.itemId = String(
-      item.id || 'questao-' + Date.now()
-    );
-    state.phase = 'ready';
-    state.since = Date.now();
-
-    report('Alternativa correta colocada em A. Aguardando renderizacao.');
-    return true;
+  function operation(url, bodyText) {
+    if (url.includes('getAssessmentItem')) return 'assessment';
+    if (url.includes('attemptProblem')) return 'attempt';
+    if (bodyText.includes('"operationName":"getAssessmentItem"')) return 'assessment';
+    if (bodyText.includes('"operationName":"attemptProblem"')) return 'attempt';
+    return null;
   }
 
-  function parseAttempt(payload) {
-    const verdict =
-      payload?.data?.attemptProblem?.result
-        ?.actionResults?.attemptCorrect;
-
-    if (verdict === true &&
-        state.phase === 'submitting') {
-      state.phase = 'correct';
-      state.since = Date.now();
-      report('Acerto confirmado pelo Khan Academy.');
-    } else if (verdict === false &&
-               state.phase === 'submitting') {
-      state.phase = 'unsupported';
-      state.active = false;
-      report('O site rejeitou a resposta. Pausado para evitar erros.');
-    }
-  }
-
-  // Mantem a validacao original da plataforma.
   window.fetch = async function (...args) {
+    const resource = args[0];
+    const url = resource instanceof Request ? resource.url : String(resource);
+    const maybeGraphql = /graphql/i.test(url);
+    const bodyPromise = maybeGraphql && resource instanceof Request
+      ? resource.clone().text().catch(() => '')
+      : Promise.resolve(maybeGraphql && typeof args[1]?.body === 'string'
+        ? args[1].body : '');
+
     const response = await originalFetch.apply(this, args);
+    if (!maybeGraphql || !response.ok) return response;
 
     try {
-      const url = args[0] instanceof Request
-        ? args[0].url
-        : String(args[0]);
-
-      if (!url.includes('getAssessmentItem') &&
-          !url.includes('attemptProblem')) {
+      const kind = operation(url, await bodyPromise);
+      if (!kind) return response;
+      const json = await response.clone().json();
+      if (kind === 'attempt') {
+        const verdict = getVerdict(json);
+        if (state.phase === 'submitting' && verdict === true) {
+          setPhase('correct', 'Resposta confirmada como correta.');
+        } else if (state.phase === 'submitting' && verdict === false) {
+          state.enabled = false;
+          setPhase('paused', 'A resposta nao foi aceita. Automação pausada.');
+        }
         return response;
       }
 
-      const payload = await response.clone().json();
-
-      if (url.includes('attemptProblem')) {
-        parseAttempt(payload);
-        return response;
-      }
-
-      if (!prepareAssessment(payload)) {
-        return response;
-      }
+      const changed = modifyAssessment(json);
+      if (!changed) return response;
+      state.patched += changed;
+      // Se ja havia uma pergunta visivel, espera a tela mudar.
+      if (!state.lastScreen) state.lastScreen = screenFingerprint();
+      report(`${changed} questão(ões) preparada(s): alternativa correta em A.`);
 
       const headers = new Headers(response.headers);
       headers.delete('content-length');
       headers.delete('content-encoding');
-
-      return new Response(JSON.stringify(payload), {
+      return new Response(JSON.stringify(json), {
         status: response.status,
         statusText: response.statusText,
         headers
       });
     } catch (error) {
-      console.warn(
-        '[Khan Stable] Resposta nao interpretada:',
-        error
-      );
+      state.errors++;
+      console.warn(NAME, 'Erro ao analisar uma resposta:', error);
       return response;
     }
   };
 
-  function findFirstChoice() {
-    const containers = document.querySelectorAll(
-      '.perseus-widget-radio, .perseus-widget-container'
-    );
-
-    for (const container of containers) {
-      const first = container.querySelector('li');
-      if (!first) continue;
-
-      const option = first.querySelector(
-        'button, input[type="radio"], label, [role="radio"]'
-      );
-
-      if (visible(option)) return option;
+  function radioList() {
+    const selectors = [
+      'ul[data-widget="radio"]',
+      '.perseus-widget-radio ul',
+      '.perseus-radio-option-list',
+      '.perseus-widget-container ul'
+    ];
+    const found = new Set();
+    for (const selector of selectors) {
+      for (const ul of document.querySelectorAll(selector)) {
+        if (visible(ul) && ul.querySelectorAll(':scope > li').length >= 2) {
+          found.add(ul);
+        }
+      }
     }
-    return null;
+    return found.size === 1 ? [...found][0] : null;
+  }
+
+  function screenFingerprint() {
+    const list = radioList();
+    if (!list) return null;
+    const labels = [...list.querySelectorAll(':scope > li')]
+      .map(li => (li.textContent || '').trim()).join('|');
+    return { list, labels };
+  }
+
+  function isNewScreen(current, previous) {
+    return !!current && (!previous ||
+      current.list !== previous.list || current.labels !== previous.labels);
+  }
+
+  function firstChoice(list) {
+    const first = list?.querySelector(':scope > li:first-child');
+    if (!first) return null;
+    return [...first.querySelectorAll('button, [role="radio"], input[type="radio"], label')]
+      .find(visible) || null;
+  }
+
+  function findButton(ids, labels) {
+    for (const id of ids) {
+      const element = document.querySelector(`[data-testid="${id}"]`);
+      if (visible(element)) return element;
+    }
+    const wanted = new Set(labels);
+    return [...document.querySelectorAll('button')].find(button =>
+      visible(button) && wanted.has((button.textContent || '').trim().toLowerCase())
+    ) || null;
+  }
+
+  function checkButton() {
+    return findButton(['exercise-check-answer'],
+      ['verificar', 'verificar resposta', 'conferir', 'check answer']);
+  }
+
+  function nextButton() {
+    return findButton(['exercise-next-question', 'exercise-next-question-button'],
+      ['próxima questão', 'próximo', 'continuar', 'next question']);
   }
 
   function tick() {
-    if (!state.active ||
-        document.visibilityState === 'hidden') return;
-
+    if (!state.enabled || document.visibilityState === 'hidden') return;
     const now = Date.now();
-    if (now - lastAction < 900) return;
+    if (now - state.lastAction < 900) return;
 
-    if (state.phase === 'ready') {
-      const first = findFirstChoice();
-      if (!first) return;
+    if (state.phase === 'waiting') {
+      if (!state.pending.length) return;
+      const screen = screenFingerprint();
+      if (!isNewScreen(screen, state.lastScreen)) return;
+      const choice = firstChoice(screen.list);
+      if (!choice) return;
+      state.lastScreen = screen;
+      state.lastAction = now;
+      choice.click();
+      setPhase('selected', 'Alternativa A selecionada.');
+      return;
+    }
 
-      lastAction = now;
-      first.click();
+    if (state.phase === 'selected' && now - state.phaseSince > 650) {
+      const button = checkButton();
+      if (!button) return;
+      state.lastAction = now;
+      setPhase('submitting', 'Verificando a resposta...');
+      button.click();
+      return;
+    }
 
-      state.phase = 'selected';
-      state.since = now;
-      report('Alternativa A selecionada.');
+    if (state.phase === 'correct' && now - state.phaseSince > 600) {
+      const button = nextButton();
+      if (!button) return;
+      state.lastScreen = screenFingerprint();
+      state.pending.shift();
+      state.lastAction = now;
+      setPhase('waiting', 'Acerto confirmado. Indo para a próxima questão...');
+      button.click();
+      return;
+    }
 
-    } else if (state.phase === 'selected' &&
-               now - state.since > 500) {
-      const check = checkButton();
-      if (!check) return;
-
-      lastAction = now;
-      state.phase = 'submitting';
-      state.since = now;
-      check.click();
-
-      report('Enviando resposta e aguardando confirmacao...');
-
-    } else if (state.phase === 'correct' &&
-               now - state.since > 500) {
-      const next = nextButton();
-      if (!next) return;
-
-      lastAction = now;
-      state.phase = 'next';
-      next.click();
-
-      report('Acerto confirmado. Avancando para a proxima questao...');
-
-    } else if (state.phase === 'submitting' &&
-               now - state.since > 15000) {
-      state.active = false;
-      state.phase = 'unsupported';
-
-      report('Nao chegou confirmacao do acerto. Automacao pausada.');
+    if (state.phase === 'submitting' && now - state.phaseSince > 15000) {
+      state.enabled = false;
+      setPhase('paused', 'Sem confirmação de acerto: automação pausada.');
     }
   }
 
-  function makePanel() {
-    if (!document.body ||
-        document.getElementById(ID)) return;
+  function toggleDark() {
+    const id = 'lb-dark';
+    const previous = document.getElementById(id);
+    if (previous) {
+      previous.remove();
+      report('Modo escuro desativado.');
+      return;
+    }
+    const style = document.createElement('style');
+    style.id = id;
+    style.textContent = `html { filter: invert(1) hue-rotate(180deg); background: #111; }
+      img, video, canvas, svg, #lb-panel { filter: invert(1) hue-rotate(180deg); }`;
+    document.head.appendChild(style);
+    report('Modo escuro ativado.');
+  }
 
-    const panel = document.createElement('div');
-    panel.id = ID;
+  function createPanel() {
+    if (!document.body || document.getElementById('lb-panel')) return;
+    const panel = document.createElement('aside');
+    panel.id = 'lb-panel';
+    panel.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483646;'+
+      'width:260px;background:#132b20;color:white;border-radius:12px;padding:14px;'+
+      'font:13px Arial,sans-serif;box-shadow:0 5px 24px #0006;';
 
-    Object.assign(panel.style, {
-      position: 'fixed',
-      right: '16px',
-      bottom: '16px',
-      zIndex: '2147483646',
-      background: '#142b20',
-      color: 'white',
-      padding: '12px 14px',
-      borderRadius: '12px',
-      width: '245px',
-      boxShadow: '0 4px 16px #0006',
-      font: '13px Arial, sans-serif'
-    });
+    const title = document.createElement('strong');
+    title.textContent = 'KHAN BYPASS 3.1';
+    title.style.cssText = 'display:block;font-size:15px;margin-bottom:8px;color:#70ffac';
 
-    const header = document.createElement('strong');
-    header.textContent = 'KB 2.9.0';
-
-    const status = document.createElement('p');
-    status.style.margin = '10px 0';
+    const status = document.createElement('div');
+    status.id = 'lb-status';
     status.textContent = state.message;
-    statusNode = status;
+    status.style.cssText = 'line-height:1.4;margin-bottom:10px';
 
-    const toggle = document.createElement('button');
-    toggle.textContent = state.active ? 'Pausar' : 'Iniciar';
-    toggleNode = toggle;
+    const count = document.createElement('div');
+    count.id = 'lb-count';
+    count.textContent = 'Questões preparadas: 0';
+    count.style.cssText = 'font-size:11px;margin-bottom:12px;color:#b7d8c4';
 
-    Object.assign(toggle.style, {
-      background: '#32a96b',
-      color: '#102016',
-      border: 'none',
-      borderRadius: '6px',
-      padding: '8px 12px',
-      cursor: 'pointer'
+    function button(id, text, action) {
+      const b = document.createElement('button');
+      b.id = id;
+      b.type = 'button';
+      b.textContent = text;
+      b.style.cssText = 'background:#1caf6a;color:#061b0f;border:0;border-radius:7px;'+
+        'padding:9px 10px;margin:0 5px 6px 0;cursor:pointer;font-weight:700;';
+      b.addEventListener('click', action);
+      panel.appendChild(b);
+      return b;
+    }
+
+    panel.append(title, status, count);
+    button('lb-toggle', 'Pausar', () => {
+      state.enabled = !state.enabled;
+      if (state.enabled && state.phase === 'paused') {
+        setPhase('waiting', 'Reativado. Abra uma nova questão para sincronizar.');
+        state.lastScreen = screenFingerprint();
+      } else {
+        report(state.enabled ? 'Automação ativada.' : 'Automação pausada.');
+      }
     });
+    button('lb-dark-btn', 'Modo escuro', toggleDark);
 
-    toggle.addEventListener('click', () => {
-      state.active = !state.active;
-      report(
-        state.active
-          ? 'Automacao ativada.'
-          : 'Automacao pausada.'
-      );
-    });
-
-    panel.append(header, status, toggle);
+    const foot = document.createElement('small');
+    foot.textContent = 'Baseado no KhanBypass v2.7. Apenas múltipla escolha simples.';
+    foot.style.cssText = 'display:block;margin-top:5px;color:#aac8b4;';
+    panel.appendChild(foot);
     document.body.appendChild(panel);
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener(
-      'DOMContentLoaded',
-      makePanel,
-      { once: true }
-    );
+    document.addEventListener('DOMContentLoaded', createPanel, { once: true });
   } else {
-    makePanel();
+    createPanel();
   }
-
-  setInterval(tick, 700);
+  const timer = setInterval(() => {
+    try { tick(); }
+    catch (error) {
+      state.enabled = false;
+      state.errors++;
+      console.error(NAME, error);
+      setPhase('paused', 'Erro de interface: automação pausada.');
+    }
+  }, 700);
+  window.addEventListener('pagehide', () => clearInterval(timer), { once: true });
 })();
