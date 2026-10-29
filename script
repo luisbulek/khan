@@ -1,9 +1,9 @@
+
  // ==UserScript==
- // @name         KhanBypass - LuisBulek 3.1 (estavel)
+ // @name         Khan Helper - LuisBulek 3.2
  // @namespace    https://github.com/luisbulek/khan
- // @version      3.1.0
- // @description  Atualizacao experimental do KhanBypass v2.7: alternativa A e avancar apenas apos acerto real.
- // @author       mzzvxm (original); adaptacao LuisBulek
+ // @version      3.2.0
+ // @description  Detecta alternativas, resolve alguns logaritmos e so avanca apos acerto confirmado.
  // @match        https://*.khanacademy.org/*
  // @match        https://khanacademy.org/*
  // @run-at       document-start
@@ -12,376 +12,658 @@
 
 (() => {
   'use strict';
-
-  const KEY = '__LB_KHAN_V31__';
+  const KEY = '__LB_KHAN_32__';
   if (window[KEY]) return;
   window[KEY] = true;
 
-  const NAME = '[KhanBypass 3.1]';
-  const state = {
-    enabled: true,
-    phase: 'waiting',
-    pending: [],
-    ids: new Set(),
-    lastScreen: null,
-    lastAction: 0,
-    phaseSince: Date.now(),
-    message: 'Aguardando dados de uma nova questão.',
-    patched: 0,
-    errors: 0
+  const st = {
+    active: false,
+    phase: 'idle',
+    message: 'Analisando pagina...',
+    source: '',
+    answer: '',
+    answeredFingerprint: '',
+    since: Date.now(),
+    lastClick: 0,
+    lastAnalyze: 0,
+    captured: [],
+    network: 0
   };
 
-  const originalFetch = window.fetch;
-  const log = (...args) => console.info(NAME, ...args);
+  const log = (...v) => console.info('[Khan 3.2]', ...v);
 
-  function report(message) {
-    state.message = message;
-    log(message);
-    const node = document.getElementById('lb-status');
-    if (node) node.textContent = message;
-    const count = document.getElementById('lb-count');
-    if (count) count.textContent = 'Questões preparadas: ' + state.patched;
-    const toggle = document.getElementById('lb-toggle');
-    if (toggle) toggle.textContent = state.enabled ? 'Pausar' : 'Ativar';
+  const norm = s => String(s || '')
+    .replace(/\\(?:text|mathrm)\s*\{([^{}]*)\}/g, '$1')
+    .replace(/\*\*/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/[,]/g, '.')
+    .replace(/[^\p{L}\p{N}.+\-/%= ]/gu, '')
+    .trim()
+    .toLowerCase();
+
+  const visible = e => !!(
+    e &&
+    e.isConnected &&
+    e.getClientRects().length &&
+    !e.disabled &&
+    e.getAttribute('aria-disabled') !== 'true'
+  );
+
+  function status(message) {
+    if (st.message !== message) log(message);
+    st.message = message;
+
+    const el = document.getElementById('lb32-status');
+    if (el) el.textContent = message;
+
+    const meta = document.getElementById('lb32-meta');
+
+    if (meta) {
+      meta.textContent =
+        `Fonte: ${st.source || 'nenhuma'} · Dados: ${st.network}`;
+    }
   }
 
-  function setPhase(phase, message) {
-    state.phase = phase;
-    state.phaseSince = Date.now();
-    if (message) report(message);
+  function phase(name, message) {
+    st.phase = name;
+    st.since = Date.now();
+    if (message) status(message);
   }
 
-  function visible(element) {
-    return !!(element && element.isConnected && !element.disabled &&
-      element.getAttribute('aria-disabled') !== 'true' &&
-      element.getClientRects().length);
+  function collectData(data) {
+    const results = Array.isArray(data) ? data : [data];
+
+    for (const result of results) {
+      const attempt = result?.data?.attemptProblem?.result;
+      const verdict =
+        attempt?.actionResults?.attemptCorrect ??
+        attempt?.attemptCorrect;
+
+      if (st.phase === 'checking' &&
+          typeof verdict === 'boolean') {
+        if (verdict) {
+          phase('correct', 'Acerto confirmado pela plataforma.');
+        } else {
+          st.active = false;
+          phase('paused', 'Resposta rejeitada pela plataforma.');
+        }
+      }
+    }
+
+    let count = 0;
+    const seen = new WeakSet();
+
+    function walk(obj, depth) {
+      if (!obj ||
+          typeof obj !== 'object' ||
+          seen.has(obj) ||
+          depth > 12) return;
+
+      seen.add(obj);
+
+      if (typeof obj.itemData === 'string') {
+        try {
+          const q = JSON.parse(obj.itemData)?.question;
+
+          for (const [key, w] of Object.entries(q?.widgets || {})) {
+            if (w?.type !== 'radio' ||
+                w.options?.multipleSelect) continue;
+
+            if (typeof q.content === 'string' &&
+                !q.content.includes('☃ ' + key)) continue;
+
+            const choices = w.options?.choices;
+            if (!Array.isArray(choices)) continue;
+
+            const correct = choices.filter(
+              c => c?.correct === true
+            );
+
+            if (correct.length !== 1) continue;
+
+            const entry = {
+              options: choices.map(c => norm(c.content)),
+              correct: norm(correct[0].content)
+            };
+
+            if (!entry.correct) continue;
+
+            st.captured.push(entry);
+            count++;
+          }
+        } catch (e) {
+          log('Item ignorado:', e.message);
+        }
+      }
+
+      if (Array.isArray(obj)) {
+        obj.forEach(v => walk(v, depth + 1));
+      } else {
+        Object.values(obj).forEach(v => walk(v, depth + 1));
+      }
+    }
+
+    walk(data, 0);
+
+    st.captured = st.captured.slice(-30);
+    st.network += count;
+
+    if (count) {
+      status(`${count} resposta(s) identificada(s) no carregamento.`);
+    }
   }
 
-  function widgetMentioned(content, key) {
-    return typeof content === 'string' &&
-      content.includes('☃ ' + key);
-  }
+  const origFetch = window.fetch;
 
-  // Reaproveita o processamento de widgets do original, mas sem fabricar
-  // respostas na requisicao attemptProblem nem substituir a pergunta.
-  function patchItemData(raw, itemId) {
-    const data = JSON.parse(raw);
-    const question = data?.question;
-    const widgets = question?.widgets;
-    if (!widgets || typeof widgets !== 'object') return null;
+  if (typeof origFetch === 'function') {
+    window.fetch = async function(...args) {
+      const response = await origFetch.apply(this, args);
 
-    const entries = Object.entries(widgets).filter(([key]) =>
-      widgetMentioned(question.content, key)
-    );
-    // Alguns exercicios nao usam marcador no enunciado.
-    const active = entries.length ? entries : Object.entries(widgets);
-    if (active.length !== 1) return null;
+      try {
+        const url = args[0] instanceof Request
+          ? args[0].url
+          : String(args[0]);
 
-    const [widgetKey, widget] = active[0];
-    if (widget?.type !== 'radio') return null;
-    const options = widget.options;
-    if (!options || options.multipleSelect || !Array.isArray(options.choices)) return null;
-    const choices = options.choices;
-    if (choices.length < 2) return null;
-    const correctIndexes = choices
-      .map((choice, index) => choice?.correct === true ? index : -1)
-      .filter(index => index >= 0);
-    if (correctIndexes.length !== 1) return null;
+        if (/getAssessmentItem|attemptProblem|graphql/i.test(url) &&
+            response.ok &&
+            (response.headers.get('content-type') || '')
+              .includes('json')) {
 
-    const index = correctIndexes[0];
-    // Mantem IDs originais, pois a validacao e feita pela plataforma.
-    const sorted = [choices[index], ...choices.filter((_, i) => i !== index)];
-    options.choices = sorted;
-    options.randomize = false;
-    return {
-      raw: JSON.stringify(data),
-      id: String(itemId || 'sem-id-' + Date.now()),
-      correctText: String(choices[index]?.content || ''),
-      key: widgetKey
+          response.clone().json()
+            .then(collectData)
+            .catch(() => {});
+        }
+      } catch (e) {
+        log('Fetch:', e.message);
+      }
+
+      return response;
     };
   }
 
-  function modifyAssessment(data) {
-    let modified = 0;
-    const roots = Array.isArray(data) ? data : [data];
-    const visited = new WeakSet();
+  function options() {
+    const containers = document.querySelectorAll(
+      '.perseus-widget-radio, ' +
+      '.perseus-radio-option-list, ' +
+      '[role="radiogroup"], fieldset'
+    );
 
-    function visit(node, depth) {
-      if (!node || typeof node !== 'object' || depth > 9 || visited.has(node)) return;
-      visited.add(node);
-      if (typeof node.itemData === 'string') {
-        try {
-          const result = patchItemData(node.itemData, node.id || node.assessmentItemId);
-          if (result) {
-            node.itemData = result.raw;
-            modified++;
-            if (!state.ids.has(result.id)) {
-              state.ids.add(result.id);
-              state.pending.push(result);
-            }
-          }
-        } catch (error) {
-          console.warn(NAME, 'Dados de questão ignorados:', error);
+    for (const c of containers) {
+      if (!visible(c)) continue;
+
+      for (const selector of [
+        '.perseus-radio-option',
+        'li',
+        'label',
+        '[role="radio"]'
+      ]) {
+        const elements = [...c.querySelectorAll(selector)]
+          .filter(visible);
+
+        const outer = elements.filter(
+          e => !elements.some(
+            other => other !== e && e.contains(other)
+          )
+        );
+
+        if (outer.length >= 2 && outer.length <= 8) {
+          return outer.map(e => ({
+            el: e,
+            text: (e.innerText || e.textContent || '').trim()
+          }));
         }
       }
-      for (const value of Object.values(node)) visit(value, depth + 1);
     }
-    for (const root of roots) visit(root, 0);
-    return modified;
+
+    const all = [
+      ...document.querySelectorAll(
+        'label, [role="radio"], .perseus-radio-option'
+      )
+    ].filter(visible)
+      .filter(e => (e.innerText || '').trim().length > 1);
+
+    const unique = all.filter(
+      e => !all.some(
+        other => other !== e && other.contains(e)
+      )
+    );
+
+    if (unique.length >= 2 && unique.length <= 8) {
+      return unique.map(e => ({
+        el: e,
+        text: (e.innerText || e.textContent || '').trim()
+      }));
+    }
+
+    const root = document.querySelector('main') || document.body;
+    const letters = new Map();
+
+    for (const e of root.querySelectorAll(
+      'button, [role="radio"], [tabindex]'
+    )) {
+      if (!visible(e)) continue;
+
+      const label = (
+        e.innerText ||
+        e.getAttribute('aria-label') ||
+        ''
+      ).trim().toUpperCase();
+
+      if (!/^[A-H]$/.test(label)) continue;
+
+      const row = e.closest(
+        'label, li, [role="radio"], .perseus-radio-option'
+      ) || e.parentElement;
+
+      const text = (row?.innerText || '').trim();
+
+      if (text.length > 2 && text.length < 120) {
+        letters.set(label, { el: e, text });
+      }
+    }
+
+    return letters.size >= 2
+      ? [...letters]
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(x => x[1])
+      : [];
   }
 
-  function getVerdict(data) {
-    const roots = Array.isArray(data) ? data : [data];
-    for (const root of roots) {
-      const result = root?.data?.attemptProblem?.result;
-      const verdict = result?.actionResults?.attemptCorrect ?? result?.attemptCorrect;
-      if (typeof verdict === 'boolean') return verdict;
+  function textArea() {
+    const root =
+      document.querySelector('.perseus-renderer') ||
+      document.querySelector('main') ||
+      document.body;
+
+    return (root?.innerText || '').slice(0, 16000);
+  }
+
+  function numericOption(text) {
+    const clean = text
+      .replace(/^\s*[A-H][.):]?\s+/i, '')
+      .replace(',', '.');
+
+    const found = clean.match(/[-+]?\d+(?:\.\d+)?/);
+
+    return found ? Number(found[0]) : NaN;
+  }
+
+  function logSolver(text) {
+    const known = new Map([[10, 1]]);
+
+    const pattern =
+      /log\s*(\d+)\s*=\s*([+-]?\d+(?:[.,]\d+)?)/gi;
+
+    for (const m of text.matchAll(pattern)) {
+      known.set(
+        Number(m[1]),
+        Number(m[2].replace(',', '.'))
+      );
     }
+
+    if (known.has(5)) {
+      known.set(2, 1 - known.get(5));
+    }
+
+    const targetMatch = text.match(
+      /(?:calcule|determine|valor\s+de)[^\n]{0,80}?log\s*(\d+)/i
+    );
+
+    if (!targetMatch) return null;
+
+    const target = Number(targetMatch[1]);
+
+    if (!Number.isSafeInteger(target) || target <= 0) {
+      return null;
+    }
+
+    let n = target;
+    let total = 0;
+
+    for (let p = 2; p <= n && p < 10000; p++) {
+      if (n % p !== 0) continue;
+      if (!known.has(p)) return null;
+
+      while (n % p === 0) {
+        total += known.get(p);
+        n /= p;
+      }
+    }
+
+    return n === 1
+      ? Number(total.toFixed(6))
+      : null;
+  }
+
+  function resolve(list) {
+    const opts = list.map(o =>
+      norm(o.text).replace(/^[a-h]\s+/, '')
+    );
+
+    for (const captured of st.captured.slice().reverse()) {
+      const overlap = opts.filter(t =>
+        captured.options.some(x =>
+          x === t ||
+          x.endsWith(' ' + t) ||
+          t.endsWith(' ' + x)
+        )
+      ).length;
+
+      if (overlap < Math.min(2, list.length)) continue;
+
+      const indexes = opts.map((t, i) =>
+        t === captured.correct ||
+        t.endsWith(' ' + captured.correct) ||
+        captured.correct.endsWith(' ' + t)
+          ? i
+          : -1
+      ).filter(i => i >= 0);
+
+      if (indexes.length === 1) {
+        return {
+          index: indexes[0],
+          source: 'dados da questao'
+        };
+      }
+    }
+
+    const calculated = logSolver(textArea());
+
+    if (calculated !== null) {
+      const matches = list.map((o, i) =>
+        Math.abs(numericOption(o.text) - calculated) < 0.000001
+          ? i
+          : -1
+      ).filter(i => i >= 0);
+
+      if (matches.length === 1) {
+        return {
+          index: matches[0],
+          source: 'calculo de logaritmo'
+        };
+      }
+    }
+
     return null;
   }
 
-  function operation(url, bodyText) {
-    if (url.includes('getAssessmentItem')) return 'assessment';
-    if (url.includes('attemptProblem')) return 'attempt';
-    if (bodyText.includes('"operationName":"getAssessmentItem"')) return 'assessment';
-    if (bodyText.includes('"operationName":"attemptProblem"')) return 'attempt';
-    return null;
-  }
-
-  window.fetch = async function (...args) {
-    const resource = args[0];
-    const url = resource instanceof Request ? resource.url : String(resource);
-    const maybeGraphql = /graphql|getAssessmentItem|attemptProblem/i.test(url);
-    const bodyPromise = maybeGraphql && resource instanceof Request
-      ? resource.clone().text().catch(() => '')
-      : Promise.resolve(maybeGraphql && typeof args[1]?.body === 'string'
-        ? args[1].body : '');
-
-    const response = await originalFetch.apply(this, args);
-    if (!maybeGraphql || !response.ok) return response;
-
-    try {
-      const kind = operation(url, await bodyPromise);
-      if (!kind) return response;
-      const json = await response.clone().json();
-      if (kind === 'attempt') {
-        const verdict = getVerdict(json);
-        if (state.phase === 'submitting' && verdict === true) {
-          setPhase('correct', 'Resposta confirmada como correta.');
-        } else if (state.phase === 'submitting' && verdict === false) {
-          state.enabled = false;
-          setPhase('paused', 'A resposta nao foi aceita. Automação pausada.');
-        }
-        return response;
-      }
-
-      const changed = modifyAssessment(json);
-      if (!changed) return response;
-      state.patched += changed;
-      // Se ja havia uma pergunta visivel, espera a tela mudar.
-      if (!state.lastScreen) state.lastScreen = screenFingerprint();
-      report(`${changed} questão(ões) preparada(s): alternativa correta em A.`);
-
-      const headers = new Headers(response.headers);
-      headers.delete('content-length');
-      headers.delete('content-encoding');
-      return new Response(JSON.stringify(json), {
-        status: response.status,
-        statusText: response.statusText,
-        headers
-      });
-    } catch (error) {
-      state.errors++;
-      console.warn(NAME, 'Erro ao analisar uma resposta:', error);
-      return response;
-    }
-  };
-
-  function radioList() {
-    const selectors = [
-      'ul[data-widget="radio"]',
-      '.perseus-widget-radio ul',
-      '.perseus-radio-option-list',
-      '.perseus-widget-container ul'
-    ];
-    const found = new Set();
-    for (const selector of selectors) {
-      for (const ul of document.querySelectorAll(selector)) {
-        if (visible(ul) && ul.querySelectorAll(':scope > li').length >= 2) {
-          found.add(ul);
-        }
-      }
-    }
-    return found.size === 1 ? [...found][0] : null;
-  }
-
-  function screenFingerprint() {
-    const list = radioList();
-    if (!list) return null;
-    const labels = [...list.querySelectorAll(':scope > li')]
-      .map(li => (li.textContent || '').trim()).join('|');
-    return { list, labels };
-  }
-
-  function isNewScreen(current, previous) {
-    return !!current && (!previous ||
-      current.list !== previous.list || current.labels !== previous.labels);
-  }
-
-  function firstChoice(list) {
-    const first = list?.querySelector(':scope > li:first-child');
-    if (!first) return null;
-    return [...first.querySelectorAll('button, [role="radio"], input[type="radio"], label')]
-      .find(visible) || null;
-  }
-
-  function findButton(ids, labels) {
+  function button(ids, labels) {
     for (const id of ids) {
-      const element = document.querySelector(`[data-testid="${id}"]`);
-      if (visible(element)) return element;
+      const b = document.querySelector(
+        `[data-testid="${id}"]`
+      );
+
+      if (visible(b)) return b;
     }
-    const wanted = new Set(labels);
-    return [...document.querySelectorAll('button')].find(button =>
-      visible(button) && wanted.has((button.textContent || '').trim().toLowerCase())
-    ) || null;
+
+    return [...document.querySelectorAll('button')]
+      .find(b =>
+        visible(b) &&
+        labels.includes(
+          (b.innerText || '').trim().toLowerCase()
+        )
+      ) || null;
   }
 
-  function checkButton() {
-    return findButton(['exercise-check-answer'],
-      ['verificar', 'verificar resposta', 'conferir', 'check answer']);
+  const check = () => button(
+    ['exercise-check-answer'],
+    [
+      'verificar',
+      'verificar resposta',
+      'conferir',
+      'check answer'
+    ]
+  );
+
+  const next = () => button(
+    [
+      'exercise-next-question',
+      'exercise-next-question-button'
+    ],
+    [
+      'próxima questão',
+      'próximo',
+      'continuar',
+      'next question'
+    ]
+  );
+
+  function fingerprint(list) {
+    return norm(textArea()).slice(0, 1000) +
+      '##' +
+      list.map(o => norm(o.text)).join('||');
   }
 
-  function nextButton() {
-    return findButton(['exercise-next-question', 'exercise-next-question-button'],
-      ['próxima questão', 'próximo', 'continuar', 'next question']);
+  function clickOption(entry) {
+    const el = entry.el;
+
+    const input = el.matches('input, [role="radio"]')
+      ? el
+      : el.querySelector(
+          'input[type="radio"], [role="radio"]'
+        );
+
+    const target = input ||
+      el.querySelector('label, button, .description') ||
+      el;
+
+    target.click();
+  }
+
+  function analyze() {
+    const list = options();
+
+    if (list.length < 2) {
+      status('Nao encontrei alternativas na tela.');
+      return;
+    }
+
+    const answer = resolve(list);
+
+    if (!answer) {
+      status(
+        `${list.length} alternativas encontradas, ` +
+        'mas sem resposta verificavel. Nao vou chutar.'
+      );
+      return;
+    }
+
+    const fp = fingerprint(list);
+
+    st.source = answer.source;
+    st.answer = String.fromCharCode(65 + answer.index);
+
+    if (fp === st.answeredFingerprint) {
+      status(`Questao ja selecionada: ${st.answer}.`);
+      return;
+    }
+
+    clickOption(list[answer.index]);
+
+    st.answeredFingerprint = fp;
+    st.lastClick = Date.now();
+
+    phase(
+      'selected',
+      `Resposta ${st.answer} selecionada (${answer.source}).`
+    );
   }
 
   function tick() {
-    if (!state.enabled || document.visibilityState === 'hidden') return;
-    const now = Date.now();
-    if (now - state.lastAction < 900) return;
+    if (!st.active ||
+        document.visibilityState === 'hidden') return;
 
-    if (state.phase === 'waiting') {
-      if (!state.pending.length) return;
-      const screen = screenFingerprint();
-      if (!isNewScreen(screen, state.lastScreen)) return;
-      const choice = firstChoice(screen.list);
-      if (!choice) return;
-      state.lastScreen = screen;
-      state.lastAction = now;
-      choice.click();
-      setPhase('selected', 'Alternativa A selecionada.');
+    if (Date.now() - st.lastClick < 1400) return;
+
+    if (st.phase === 'idle') {
+      if (Date.now() - st.lastAnalyze < 3000) return;
+
+      st.lastAnalyze = Date.now();
+      analyze();
       return;
     }
 
-    if (state.phase === 'selected' && now - state.phaseSince > 650) {
-      const button = checkButton();
-      if (!button) return;
-      state.lastAction = now;
-      setPhase('submitting', 'Verificando a resposta...');
-      button.click();
+    if (st.phase === 'selected') {
+      const b = check();
+
+      if (b) {
+        st.lastClick = Date.now();
+        b.click();
+
+        phase(
+          'checking',
+          'Resposta enviada; aguardando resultado visivel.'
+        );
+      }
+
       return;
     }
 
-    if (state.phase === 'correct' && now - state.phaseSince > 600) {
-      const button = nextButton();
-      if (!button) return;
-      state.lastScreen = screenFingerprint();
-      state.pending.shift();
-      state.lastAction = now;
-      setPhase('waiting', 'Acerto confirmado. Indo para a próxima questão...');
-      button.click();
+    if (st.phase === 'checking') {
+      const screen = (
+        document.body?.innerText || ''
+      ).toLowerCase();
+
+      const success =
+        /(?:resposta correta|muito bem|parab[eé]ns|correct answer|resposta certa|mandou bem|voce acertou|você acertou|acertou!)/i
+          .test(screen);
+
+      if (success && next()) {
+        phase(
+          'correct',
+          'Acerto exibido pela plataforma.'
+        );
+      } else if (Date.now() - st.since > 12000) {
+        st.active = false;
+
+        phase(
+          'paused',
+          'Sem confirmacao de acerto. Pausado para evitar pular questoes.'
+        );
+      }
+
       return;
     }
 
-    if (state.phase === 'submitting' && now - state.phaseSince > 15000) {
-      state.enabled = false;
-      setPhase('paused', 'Sem confirmação de acerto: automação pausada.');
+    if (st.phase === 'correct') {
+      const b = next();
+
+      if (b) {
+        st.lastClick = Date.now();
+        b.click();
+
+        phase(
+          'transition',
+          'Avancando apos acerto confirmado.'
+        );
+      }
+
+      return;
+    }
+
+    if (st.phase === 'transition') {
+      const current = options();
+
+      if (
+        current.length >= 2 &&
+        fingerprint(current) !== st.answeredFingerprint
+      ) {
+        phase('idle', 'Nova questao detectada.');
+      }
     }
   }
 
-  function toggleDark() {
-    const id = 'lb-dark';
-    const previous = document.getElementById(id);
-    if (previous) {
-      previous.remove();
-      report('Modo escuro desativado.');
-      return;
-    }
-    const style = document.createElement('style');
-    style.id = id;
-    style.textContent = `html { filter: invert(1) hue-rotate(180deg); background: #111; }
-      img, video, canvas, svg, #lb-panel { filter: invert(1) hue-rotate(180deg); }`;
-    document.head.appendChild(style);
-    report('Modo escuro ativado.');
-  }
+  function panel() {
+    if (!document.body ||
+        document.getElementById('lb32-panel')) return;
 
-  function createPanel() {
-    if (!document.body || document.getElementById('lb-panel')) return;
-    const panel = document.createElement('aside');
-    panel.id = 'lb-panel';
-    panel.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483646;'+
-      'width:260px;background:#132b20;color:white;border-radius:12px;padding:14px;'+
-      'font:13px Arial,sans-serif;box-shadow:0 5px 24px #0006;';
+    const p = document.createElement('section');
+    p.id = 'lb32-panel';
+
+    p.style.cssText =
+      'position:fixed;top:85px;right:16px;width:260px;' +
+      'z-index:2147483646;background:#123225;color:#e4fff0;' +
+      'padding:14px;border-radius:12px;' +
+      'box-shadow:0 5px 20px #0006;' +
+      'font:13px Arial,sans-serif;';
 
     const title = document.createElement('strong');
-    title.textContent = 'KHAN BYPASS 3.1';
-    title.style.cssText = 'display:block;font-size:15px;margin-bottom:8px;color:#70ffac';
+    title.textContent = 'KHAN HELPER 3.2';
 
-    const status = document.createElement('div');
-    status.id = 'lb-status';
-    status.textContent = state.message;
-    status.style.cssText = 'line-height:1.4;margin-bottom:10px';
+    const line = document.createElement('p');
+    line.id = 'lb32-status';
+    line.textContent = st.message;
 
-    const count = document.createElement('div');
-    count.id = 'lb-count';
-    count.textContent = 'Questões preparadas: 0';
-    count.style.cssText = 'font-size:11px;margin-bottom:12px;color:#b7d8c4';
+    const meta = document.createElement('p');
+    meta.id = 'lb32-meta';
+    meta.style.cssText = 'font-size:11px;opacity:.8';
+    meta.textContent = 'Fonte: nenhuma · Dados: 0';
 
-    function button(id, text, action) {
+    const mk = (text, fn) => {
       const b = document.createElement('button');
-      b.id = id;
-      b.type = 'button';
+
       b.textContent = text;
-      b.style.cssText = 'background:#1caf6a;color:#061b0f;border:0;border-radius:7px;'+
-        'padding:9px 10px;margin:0 5px 6px 0;cursor:pointer;font-weight:700;';
-      b.addEventListener('click', action);
-      panel.appendChild(b);
+
+      b.style.cssText =
+        'background:#21ad70;border:0;border-radius:7px;' +
+        'padding:9px;margin-right:6px;margin-bottom:6px;' +
+        'cursor:pointer;color:#032015;';
+
+      b.onclick = fn;
       return b;
-    }
+    };
 
-    panel.append(title, status, count);
-    button('lb-toggle', 'Pausar', () => {
-      state.enabled = !state.enabled;
-      if (state.enabled && state.phase === 'paused') {
-        setPhase('waiting', 'Reativado. Abra uma nova questão para sincronizar.');
-        state.lastScreen = screenFingerprint();
-      } else {
-        report(state.enabled ? 'Automação ativada.' : 'Automação pausada.');
+    const start = mk('Iniciar', () => {
+      st.active = !st.active;
+
+      if (
+        st.active &&
+        ['paused', 'idle'].includes(st.phase)
+      ) {
+        st.phase = 'idle';
       }
-    });
-    button('lb-dark-btn', 'Modo escuro', toggleDark);
 
-    const foot = document.createElement('small');
-    foot.textContent = 'Baseado no KhanBypass v2.7. Apenas múltipla escolha simples.';
-    foot.style.cssText = 'display:block;margin-top:5px;color:#aac8b4;';
-    panel.appendChild(foot);
-    document.body.appendChild(panel);
+      start.textContent = st.active
+        ? 'Pausar'
+        : 'Iniciar';
+
+      status(
+        st.active
+          ? 'Automacao iniciada.'
+          : 'Automacao pausada.'
+      );
+    });
+
+    const scan = mk(
+      'Analisar questao',
+      () => analyze()
+    );
+
+    p.append(title, line, meta, start, scan);
+    document.body.appendChild(p);
+
+    status(
+      'Pronto. Clique em Analisar questao ou Iniciar.'
+    );
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', createPanel, { once: true });
+    document.addEventListener(
+      'DOMContentLoaded',
+      panel,
+      { once: true }
+    );
   } else {
-    createPanel();
+    panel();
   }
-  const timer = setInterval(() => {
-    try { tick(); }
-    catch (error) {
-      state.enabled = false;
-      state.errors++;
-      console.error(NAME, error);
-      setPhase('paused', 'Erro de interface: automação pausada.');
+
+  setInterval(() => {
+    try {
+      tick();
+    } catch (e) {
+      st.active = false;
+      console.error('[Khan 3.2]', e);
+      status('Erro: ' + e.message);
     }
-  }, 700);
-  window.addEventListener('pagehide', () => clearInterval(timer), { once: true });
+  }, 1000);
 })();
