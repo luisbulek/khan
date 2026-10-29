@@ -152,7 +152,7 @@
   window.fetch = async function (...args) {
     const resource = args[0];
     const url = resource instanceof Request ? resource.url : String(resource);
-    const maybeGraphql = /graphql/i.test(url);
+    const maybeGraphql = /graphql|getAssessmentItem|attemptProblem/i.test(url);
     const bodyPromise = maybeGraphql && resource instanceof Request
       ? resource.clone().text().catch(() => '')
       : Promise.resolve(maybeGraphql && typeof args[1]?.body === 'string'
