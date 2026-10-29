@@ -1,102 +1,109 @@
 
-```javascript
-// ==UserScript==
-// @name         KhanBypass Estavel - 2.8.2
-// @namespace    khan-stable
-// @version      2.8.2
-// @description  Painel de controles sem travamentos
-// @match        https://pt.khanacademy.org/*
-// @grant        none
-// @run-at       document-idle
-// ==/UserScript==
+ // ==UserScript==
+ // @name         Khan Stable - LuisBulek
+ // @namespace    https://github.com/luisbulek/khan
+ // @version      2.8.3
+ // @description  Painel leve de controles para Khan Academy
+ // @match        https://*.khanacademy.org/*
+ // @match        https://khanacademy.org/*
+ // @grant        none
+ // @run-at       document-idle
+ // ==/UserScript==
 
 (function () {
     "use strict";
 
-    if (window.__khanStableLoaded) return;
-    window.__khanStableLoaded = true;
+    const APP_ID = "luisbulek-khan-stable";
+    const BUTTON_ID = APP_ID + "-button";
+    const PANEL_ID = APP_ID + "-panel";
+    const DARK_STYLE_ID = APP_ID + "-dark";
+    const MIN_CLICK_INTERVAL = 2500;
+    const AUTO_INTERVAL = 3500;
 
-    const CONFIG = {
-        darkMode: false,
-        autoAdvance: false,
-        interval: 3000
-    };
-
-    let timer = null;
-    let lastClick = 0;
-
-    function log(message) {
-        console.log("[Khan Stable]", message);
+    // Evita criar vários painéis ou temporizadores.
+    if (document.getElementById(BUTTON_ID)) {
+        console.info("[Khan Stable] Já está aberto.");
+        return;
     }
+
+    let autoTimer = null;
+    let lastClick = 0;
+    let notificationTimer = null;
 
     function notify(message) {
-        const toast = document.createElement("div");
+        let toast = document.getElementById(APP_ID + "-toast");
+
+        if (!toast) {
+            toast = document.createElement("div");
+            toast.id = APP_ID + "-toast";
+
+            Object.assign(toast.style, {
+                position: "fixed",
+                left: "50%",
+                bottom: "86px",
+                transform: "translateX(-50%)",
+                padding: "10px 16px",
+                borderRadius: "9px",
+                background: "#163d2b",
+                color: "#fff",
+                font: "13px Arial, sans-serif",
+                boxShadow: "0 4px 18px #0005",
+                zIndex: "2147483647",
+                maxWidth: "80vw",
+                textAlign: "center"
+            });
+
+            document.body.appendChild(toast);
+        }
+
         toast.textContent = message;
+        toast.style.display = "block";
+        clearTimeout(notificationTimer);
 
-        Object.assign(toast.style, {
-            position: "fixed",
-            bottom: "80px",
-            left: "50%",
-            transform: "translateX(-50%)",
-            background: "#163d2b",
-            color: "white",
-            padding: "12px 18px",
-            borderRadius: "10px",
-            zIndex: "2147483647",
-            fontFamily: "Arial",
-            fontSize: "13px"
-        });
-
-        document.body.appendChild(toast);
-
-        setTimeout(() => toast.remove(), 2500);
+        notificationTimer = setTimeout(() => {
+            if (toast.isConnected) {
+                toast.style.display = "none";
+            }
+        }, 2400);
     }
 
-    function safeClick(element) {
-        if (!element || !element.isConnected) {
-            return false;
-        }
-
-        if (element.disabled) return false;
-
-        if (element.getClientRects().length === 0) {
-            return false;
-        }
-
-        const now = Date.now();
-
-        if (now - lastClick < 2500) {
-            return false;
-        }
-
-        lastClick = now;
-        element.click();
-
-        return true;
+    function isClickable(element) {
+        return Boolean(
+            element &&
+            element.isConnected &&
+            !element.disabled &&
+            element.getAttribute("aria-disabled") !== "true" &&
+            element.getClientRects().length > 0
+        );
     }
 
-    function findButton() {
+    function findNextButton() {
         const selectors = [
             '[data-testid="exercise-next-question"]',
-            'button[data-testid="exercise-next-question"]'
+            '[data-testid="exercise-next-question-button"]'
         ];
 
         for (const selector of selectors) {
             const element = document.querySelector(selector);
 
-            if (element) return element;
+            if (isClickable(element)) {
+                return element;
+            }
         }
 
-        const buttons = document.querySelectorAll("button");
+        const labels = new Set([
+            "próxima questão",
+            "proxima questao",
+            "próxima pergunta",
+            "proxima pergunta"
+        ]);
 
-        for (const button of buttons) {
-            const text = button.textContent.trim().toLowerCase();
+        for (const button of document.querySelectorAll("button")) {
+            const text = (button.textContent || "")
+                .trim()
+                .toLowerCase();
 
-            if (
-                text === "próxima questão" ||
-                text === "próximo" ||
-                text === "continuar"
-            ) {
+            if (labels.has(text) && isClickable(button)) {
                 return button;
             }
         }
@@ -104,66 +111,81 @@
         return null;
     }
 
-    function advanceOnce() {
-        const button = findButton();
+    function advanceOnce(showMessage = true) {
+        const button = findNextButton();
 
         if (!button) {
-            notify("Nenhum botão de avançar disponível.");
+            if (showMessage) {
+                notify("Nenhum botão de próxima questão disponível.");
+            }
             return false;
         }
 
-        return safeClick(button);
-    }
+        const now = Date.now();
 
-    function stopAutomation() {
-        CONFIG.autoAdvance = false;
-
-        if (timer !== null) {
-            clearInterval(timer);
-            timer = null;
+        if (now - lastClick < MIN_CLICK_INTERVAL) {
+            return false;
         }
 
-        log("Automação interrompida.");
+        lastClick = now;
+        button.click();
+
+        if (showMessage) {
+            notify("Avançou para a próxima questão.");
+        }
+
+        return true;
     }
 
-    function startAutomation() {
-        if (timer !== null) return;
+    function stopAuto() {
+        if (autoTimer !== null) {
+            clearInterval(autoTimer);
+            autoTimer = null;
+        }
 
-        CONFIG.autoAdvance = true;
+        updateAutoLabel();
+    }
 
-        timer = setInterval(() => {
-            if (!CONFIG.autoAdvance) return;
+    function toggleAuto() {
+        if (autoTimer !== null) {
+            stopAuto();
+            notify("Auto-avançar desligado.");
+            return;
+        }
 
+        autoTimer = setInterval(() => {
             if (document.visibilityState !== "visible") {
                 return;
             }
 
             try {
-                const button = findButton();
-
-                if (button) safeClick(button);
+                advanceOnce(false);
             } catch (error) {
-                console.error("[Khan Stable]", error);
-                stopAutomation();
+                console.error(
+                    "[Khan Stable] Erro no auto-avançar:",
+                    error
+                );
+
+                stopAuto();
+                notify("Auto-avançar pausado por erro.");
             }
+        }, AUTO_INTERVAL);
 
-        }, CONFIG.interval);
-
-        log("Auto-avançar ativado.");
+        updateAutoLabel();
+        notify("Auto-avançar ligado.");
     }
 
-    function toggleDarkMode() {
-        let style = document.getElementById("kb-dark-style");
+    function toggleDark() {
+        const existing = document.getElementById(DARK_STYLE_ID);
 
-        if (style) {
-            style.remove();
-            CONFIG.darkMode = false;
-            notify("Modo escuro desativado.");
+        if (existing) {
+            existing.remove();
+            notify("Modo escuro desligado.");
             return;
         }
 
-        style = document.createElement("style");
-        style.id = "kb-dark-style";
+        const style = document.createElement("style");
+        style.id = DARK_STYLE_ID;
 
         style.textContent = `
             html {
@@ -174,22 +196,69 @@
             img, video, canvas, svg {
                 filter: invert(1) hue-rotate(180deg);
             }
+
+            #${BUTTON_ID},
+            #${PANEL_ID},
+            #${APP_ID}-toast {
+                filter: invert(1) hue-rotate(180deg);
+            }
         `;
 
         document.head.appendChild(style);
-        CONFIG.darkMode = true;
-
-        notify("Modo escuro ativado.");
+        notify("Modo escuro ligado.");
     }
 
-    function createPanel() {
-        if (document.getElementById("kb-toggle")) return;
+    let autoButton;
 
-        const toggle = document.createElement("button");
-        toggle.id = "kb-toggle";
-        toggle.textContent = "KB";
+    function updateAutoLabel() {
+        if (autoButton) {
+            autoButton.textContent = autoTimer === null
+                ? "Auto-avançar: DESLIGADO"
+                : "Auto-avançar: LIGADO";
+        }
+    }
 
-        Object.assign(toggle.style, {
+    function createAction(label, action) {
+        const button = document.createElement("button");
+
+        button.type = "button";
+        button.textContent = label;
+
+        Object.assign(button.style, {
+            display: "block",
+            width: "100%",
+            margin: "0 0 9px",
+            padding: "11px",
+            background: "#28533c",
+            color: "white",
+            border: "1px solid #357e59",
+            borderRadius: "8px",
+            textAlign: "left",
+            cursor: "pointer",
+            font: "13px Arial, sans-serif"
+        });
+
+        button.addEventListener("click", action);
+
+        return button;
+    }
+
+    function start() {
+        if (!document.body) return;
+        if (document.getElementById(BUTTON_ID)) return;
+
+        const opener = document.createElement("button");
+
+        opener.id = BUTTON_ID;
+        opener.type = "button";
+        opener.textContent = "KB";
+
+        opener.setAttribute(
+            "aria-label",
+            "Abrir controles do Khan Stable"
+        );
+
+        Object.assign(opener.style, {
             position: "fixed",
             right: "20px",
             bottom: "20px",
@@ -199,126 +268,106 @@
             background: "#13a66b",
             color: "white",
             border: "none",
-            fontWeight: "bold",
-            fontSize: "16px",
+            font: "bold 16px Arial, sans-serif",
             cursor: "pointer",
-            zIndex: "2147483646"
+            zIndex: "2147483646",
+            boxShadow: "0 4px 18px #0005"
         });
 
         const panel = document.createElement("div");
+        panel.id = PANEL_ID;
 
         Object.assign(panel.style, {
             position: "fixed",
             right: "20px",
-            bottom: "85px",
+            bottom: "84px",
             width: "250px",
+            boxSizing: "border-box",
             padding: "16px",
             borderRadius: "14px",
             background: "#17241d",
             color: "white",
             display: "none",
             zIndex: "2147483646",
-            fontFamily: "Arial",
+            font: "13px Arial, sans-serif",
             boxShadow: "0 4px 20px #0006"
         });
 
-        const title = document.createElement("h3");
-        title.textContent = "KHAN STABLE 2.8.2";
-        title.style.margin = "0 0 15px";
+        const heading = document.createElement("strong");
 
-        panel.appendChild(title);
+        heading.textContent = "KHAN STABLE 2.8.3";
+        heading.style.display = "block";
+        heading.style.marginBottom = "15px";
 
-        function makeButton(text, action) {
-            const button = document.createElement("button");
-            button.textContent = text;
+        panel.appendChild(heading);
 
-            Object.assign(button.style, {
-                display: "block",
-                width: "100%",
-                marginBottom: "9px",
-                padding: "11px",
-                background: "#28533c",
-                border: "1px solid #347b57",
-                borderRadius: "8px",
-                color: "white",
-                cursor: "pointer",
-                textAlign: "left"
-            });
-
-            button.addEventListener("click", action);
-            panel.appendChild(button);
-
-            return button;
-        }
-
-        const autoButton = makeButton(
-            "Auto-avançar: OFF",
-            () => {
-                if (CONFIG.autoAdvance) {
-                    stopAutomation();
-                } else {
-                    startAutomation();
-                }
-
-                autoButton.textContent =
-                    CONFIG.autoAdvance
-                    ? "Auto-avançar: ON"
-                    : "Auto-avançar: OFF";
-            }
+        autoButton = createAction(
+            "Auto-avançar: DESLIGADO",
+            toggleAuto
         );
 
-        makeButton("Avançar uma vez", advanceOnce);
+        panel.appendChild(autoButton);
 
-        makeButton("Alternar modo escuro", toggleDarkMode);
+        panel.appendChild(
+            createAction("Avançar uma vez", () => {
+                advanceOnce(true);
+            })
+        );
 
-        makeButton("Parar automação", () => {
-            stopAutomation();
-            autoButton.textContent = "Auto-avançar: OFF";
-            notify("Automação parada.");
-        });
+        panel.appendChild(
+            createAction("Alternar modo escuro", toggleDark)
+        );
 
-        const description = document.createElement("p");
-        description.textContent =
-            "Controles experimentais. Nenhuma alteração de respostas ou progresso.";
-        description.style.fontSize = "11px";
-        description.style.color = "#b7cfc0";
+        panel.appendChild(
+            createAction("Parar automação", () => {
+                stopAuto();
+                notify("Automação interrompida.");
+            })
+        );
 
-        panel.appendChild(description);
+        const footnote = document.createElement("small");
 
-        toggle.addEventListener("click", () => {
-            panel.style.display =
-                panel.style.display === "none"
-                ? "block"
-                : "none";
+        footnote.textContent =
+            "Avança apenas quando o botão de próxima questão " +
+            "está disponível. Não altera respostas ou notas.";
+
+        footnote.style.color = "#b7cfc0";
+        panel.appendChild(footnote);
+
+        opener.addEventListener("click", () => {
+            const open = panel.style.display === "none";
+
+            panel.style.display = open ? "block" : "none";
+
+            opener.setAttribute(
+                "aria-expanded",
+                String(open)
+            );
         });
 
         document.body.appendChild(panel);
-        document.body.appendChild(toggle);
+        document.body.appendChild(opener);
 
-        log("Painel carregado.");
-    }
+        window.addEventListener(
+            "pagehide",
+            stopAuto,
+            { once: true }
+        );
 
-    function initialize() {
-        try {
-            createPanel();
-            log("Khan Stable iniciado.");
-            notify("Khan Stable 2.8.2 carregado!");
-        } catch (error) {
-            console.error("[Khan Stable] Falha:", error);
-        }
+        console.info(
+            "[Khan Stable] Iniciado com sucesso."
+        );
+
+        notify("Khan Stable 2.8.3 carregado!");
     }
 
     if (document.readyState === "loading") {
         document.addEventListener(
             "DOMContentLoaded",
-            initialize,
+            start,
             { once: true }
         );
     } else {
-        initialize();
+        start();
     }
-
-    window.addEventListener("pagehide", stopAutomation);
-
 })();
-```
