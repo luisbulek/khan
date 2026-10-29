@@ -1,373 +1,356 @@
 
  // ==UserScript==
- // @name         Khan Stable - LuisBulek
+ // @name         Khan Stable - LuisBulek 2.9.0
  // @namespace    https://github.com/luisbulek/khan
- // @version      2.8.3
- // @description  Painel leve de controles para Khan Academy
+ // @version      2.9.0
+ // @description  Reordena alternativas identificadas e avanca somente apos acerto confirmado
  // @match        https://*.khanacademy.org/*
  // @match        https://khanacademy.org/*
+ // @run-at       document-start
  // @grant        none
- // @run-at       document-idle
  // ==/UserScript==
 
-(function () {
-    "use strict";
+(() => {
+  'use strict';
+  if (window.__LB_KHAN_290__) return;
+  window.__LB_KHAN_290__ = true;
 
-    const APP_ID = "luisbulek-khan-stable";
-    const BUTTON_ID = APP_ID + "-button";
-    const PANEL_ID = APP_ID + "-panel";
-    const DARK_STYLE_ID = APP_ID + "-dark";
-    const MIN_CLICK_INTERVAL = 2500;
-    const AUTO_INTERVAL = 3500;
+  const ID = 'lb-khan-290';
+  const state = {
+    active: true,
+    phase: 'idle',
+    itemId: null,
+    since: Date.now(),
+    message: 'Aguardando uma nova questao...'
+  };
+  let statusNode = null;
+  let toggleNode = null;
+  let lastAction = 0;
+  const originalFetch = window.fetch;
 
-    // Evita criar vários painéis ou temporizadores.
-    if (document.getElementById(BUTTON_ID)) {
-        console.info("[Khan Stable] Já está aberto.");
-        return;
+  function report(message) {
+    state.message = message;
+    console.info('[Khan Stable]', message);
+    if (statusNode) statusNode.textContent = message;
+    if (toggleNode) toggleNode.textContent =
+      state.active ? 'Pausar' : 'Iniciar';
+  }
+
+  function visible(el) {
+    return Boolean(el && el.isConnected && !el.disabled &&
+      el.getAttribute('aria-disabled') !== 'true' &&
+      el.getClientRects().length);
+  }
+
+  function buttonByTestId(ids) {
+    for (const id of ids) {
+      const btn = document.querySelector(
+        `[data-testid="${id}"]`
+      );
+      if (visible(btn)) return btn;
+    }
+    return null;
+  }
+
+  function buttonByText(values) {
+    const allowed = new Set(values);
+    return [...document.querySelectorAll('button')].find(el =>
+      visible(el) &&
+      allowed.has((el.textContent || '').trim().toLowerCase())
+    ) || null;
+  }
+
+  function checkButton() {
+    return buttonByTestId(['exercise-check-answer']) ||
+      buttonByText([
+        'verificar',
+        'verificar resposta',
+        'check answer'
+      ]);
+  }
+
+  function nextButton() {
+    return buttonByTestId([
+      'exercise-next-question',
+      'exercise-next-question-button'
+    ]) || buttonByText([
+      'próxima questão',
+      'proxima questao',
+      'próxima pergunta',
+      'proxima pergunta',
+      'next question'
+    ]);
+  }
+
+  function findQuestionItem(payload) {
+    if (!payload || !payload.data) return null;
+    for (const section of Object.values(payload.data)) {
+      if (section && section.item &&
+          typeof section.item.itemData === 'string') {
+        return section.item;
+      }
+    }
+    return null;
+  }
+
+  function prepareAssessment(payload) {
+    const item = findQuestionItem(payload);
+    if (!item) return false;
+
+    let data;
+    try {
+      data = JSON.parse(item.itemData);
+    } catch {
+      return false;
     }
 
-    let autoTimer = null;
-    let lastClick = 0;
-    let notificationTimer = null;
-
-    function notify(message) {
-        let toast = document.getElementById(APP_ID + "-toast");
-
-        if (!toast) {
-            toast = document.createElement("div");
-            toast.id = APP_ID + "-toast";
-
-            Object.assign(toast.style, {
-                position: "fixed",
-                left: "50%",
-                bottom: "86px",
-                transform: "translateX(-50%)",
-                padding: "10px 16px",
-                borderRadius: "9px",
-                background: "#163d2b",
-                color: "#fff",
-                font: "13px Arial, sans-serif",
-                boxShadow: "0 4px 18px #0005",
-                zIndex: "2147483647",
-                maxWidth: "80vw",
-                textAlign: "center"
-            });
-
-            document.body.appendChild(toast);
-        }
-
-        toast.textContent = message;
-        toast.style.display = "block";
-        clearTimeout(notificationTimer);
-
-        notificationTimer = setTimeout(() => {
-            if (toast.isConnected) {
-                toast.style.display = "none";
-            }
-        }, 2400);
+    const question = data && data.question;
+    if (!question ||
+        typeof question.content !== 'string' ||
+        !question.widgets) {
+      return false;
     }
 
-    function isClickable(element) {
-        return Boolean(
-            element &&
-            element.isConnected &&
-            !element.disabled &&
-            element.getAttribute("aria-disabled") !== "true" &&
-            element.getClientRects().length > 0
-        );
+    const used = Object.entries(question.widgets)
+      .filter(([key]) =>
+        question.content.includes('☃ ' + key)
+      );
+
+    if (used.length !== 1 ||
+        used[0][1].type !== 'radio') {
+      state.phase = 'unsupported';
+      report('Questao nao compativel: nenhum clique automatico.');
+      return false;
     }
 
-    function findNextButton() {
-        const selectors = [
-            '[data-testid="exercise-next-question"]',
-            '[data-testid="exercise-next-question-button"]'
-        ];
+    const widget = used[0][1];
+    const choices = widget.options && widget.options.choices;
 
-        for (const selector of selectors) {
-            const element = document.querySelector(selector);
-
-            if (isClickable(element)) {
-                return element;
-            }
-        }
-
-        const labels = new Set([
-            "próxima questão",
-            "proxima questao",
-            "próxima pergunta",
-            "proxima pergunta"
-        ]);
-
-        for (const button of document.querySelectorAll("button")) {
-            const text = (button.textContent || "")
-                .trim()
-                .toLowerCase();
-
-            if (labels.has(text) && isClickable(button)) {
-                return button;
-            }
-        }
-
-        return null;
+    if (!Array.isArray(choices) ||
+        choices.length < 2 ||
+        widget.options.multipleSelect ||
+        choices.filter(c => c.correct === true).length !== 1) {
+      state.phase = 'unsupported';
+      report('Resposta correta nao disponivel; automacao parada nesta questao.');
+      return false;
     }
 
-    function advanceOnce(showMessage = true) {
-        const button = findNextButton();
+    const correctIndex = choices.findIndex(
+      choice => choice.correct === true
+    );
 
-        if (!button) {
-            if (showMessage) {
-                notify("Nenhum botão de próxima questão disponível.");
-            }
-            return false;
-        }
+    const reordered = [
+      choices[correctIndex],
+      ...choices.filter((_, index) => index !== correctIndex)
+    ];
 
-        const now = Date.now();
+    widget.options.choices = reordered;
+    widget.options.randomize = false;
+    item.itemData = JSON.stringify(data);
 
-        if (now - lastClick < MIN_CLICK_INTERVAL) {
-            return false;
-        }
+    state.itemId = String(
+      item.id || 'questao-' + Date.now()
+    );
+    state.phase = 'ready';
+    state.since = Date.now();
 
-        lastClick = now;
-        button.click();
+    report('Alternativa correta colocada em A. Aguardando renderizacao.');
+    return true;
+  }
 
-        if (showMessage) {
-            notify("Avançou para a próxima questão.");
-        }
+  function parseAttempt(payload) {
+    const verdict =
+      payload?.data?.attemptProblem?.result
+        ?.actionResults?.attemptCorrect;
 
-        return true;
+    if (verdict === true &&
+        state.phase === 'submitting') {
+      state.phase = 'correct';
+      state.since = Date.now();
+      report('Acerto confirmado pelo Khan Academy.');
+    } else if (verdict === false &&
+               state.phase === 'submitting') {
+      state.phase = 'unsupported';
+      state.active = false;
+      report('O site rejeitou a resposta. Pausado para evitar erros.');
     }
+  }
 
-    function stopAuto() {
-        if (autoTimer !== null) {
-            clearInterval(autoTimer);
-            autoTimer = null;
-        }
+  // Mantem a validacao original da plataforma.
+  window.fetch = async function (...args) {
+    const response = await originalFetch.apply(this, args);
 
-        updateAutoLabel();
+    try {
+      const url = args[0] instanceof Request
+        ? args[0].url
+        : String(args[0]);
+
+      if (!url.includes('getAssessmentItem') &&
+          !url.includes('attemptProblem')) {
+        return response;
+      }
+
+      const payload = await response.clone().json();
+
+      if (url.includes('attemptProblem')) {
+        parseAttempt(payload);
+        return response;
+      }
+
+      if (!prepareAssessment(payload)) {
+        return response;
+      }
+
+      const headers = new Headers(response.headers);
+      headers.delete('content-length');
+      headers.delete('content-encoding');
+
+      return new Response(JSON.stringify(payload), {
+        status: response.status,
+        statusText: response.statusText,
+        headers
+      });
+    } catch (error) {
+      console.warn(
+        '[Khan Stable] Resposta nao interpretada:',
+        error
+      );
+      return response;
     }
+  };
 
-    function toggleAuto() {
-        if (autoTimer !== null) {
-            stopAuto();
-            notify("Auto-avançar desligado.");
-            return;
-        }
+  function findFirstChoice() {
+    const containers = document.querySelectorAll(
+      '.perseus-widget-radio, .perseus-widget-container'
+    );
 
-        autoTimer = setInterval(() => {
-            if (document.visibilityState !== "visible") {
-                return;
-            }
+    for (const container of containers) {
+      const first = container.querySelector('li');
+      if (!first) continue;
 
-            try {
-                advanceOnce(false);
-            } catch (error) {
-                console.error(
-                    "[Khan Stable] Erro no auto-avançar:",
-                    error
-                );
+      const option = first.querySelector(
+        'button, input[type="radio"], label, [role="radio"]'
+      );
 
-                stopAuto();
-                notify("Auto-avançar pausado por erro.");
-            }
-        }, AUTO_INTERVAL);
-
-        updateAutoLabel();
-        notify("Auto-avançar ligado.");
+      if (visible(option)) return option;
     }
+    return null;
+  }
 
-    function toggleDark() {
-        const existing = document.getElementById(DARK_STYLE_ID);
+  function tick() {
+    if (!state.active ||
+        document.visibilityState === 'hidden') return;
 
-        if (existing) {
-            existing.remove();
-            notify("Modo escuro desligado.");
-            return;
-        }
+    const now = Date.now();
+    if (now - lastAction < 900) return;
 
-        const style = document.createElement("style");
-        style.id = DARK_STYLE_ID;
+    if (state.phase === 'ready') {
+      const first = findFirstChoice();
+      if (!first) return;
 
-        style.textContent = `
-            html {
-                filter: invert(1) hue-rotate(180deg);
-                background: #111;
-            }
+      lastAction = now;
+      first.click();
 
-            img, video, canvas, svg {
-                filter: invert(1) hue-rotate(180deg);
-            }
+      state.phase = 'selected';
+      state.since = now;
+      report('Alternativa A selecionada.');
 
-            #${BUTTON_ID},
-            #${PANEL_ID},
-            #${APP_ID}-toast {
-                filter: invert(1) hue-rotate(180deg);
-            }
-        `;
+    } else if (state.phase === 'selected' &&
+               now - state.since > 500) {
+      const check = checkButton();
+      if (!check) return;
 
-        document.head.appendChild(style);
-        notify("Modo escuro ligado.");
+      lastAction = now;
+      state.phase = 'submitting';
+      state.since = now;
+      check.click();
+
+      report('Enviando resposta e aguardando confirmacao...');
+
+    } else if (state.phase === 'correct' &&
+               now - state.since > 500) {
+      const next = nextButton();
+      if (!next) return;
+
+      lastAction = now;
+      state.phase = 'next';
+      next.click();
+
+      report('Acerto confirmado. Avancando para a proxima questao...');
+
+    } else if (state.phase === 'submitting' &&
+               now - state.since > 15000) {
+      state.active = false;
+      state.phase = 'unsupported';
+
+      report('Nao chegou confirmacao do acerto. Automacao pausada.');
     }
+  }
 
-    let autoButton;
+  function makePanel() {
+    if (!document.body ||
+        document.getElementById(ID)) return;
 
-    function updateAutoLabel() {
-        if (autoButton) {
-            autoButton.textContent = autoTimer === null
-                ? "Auto-avançar: DESLIGADO"
-                : "Auto-avançar: LIGADO";
-        }
-    }
+    const panel = document.createElement('div');
+    panel.id = ID;
 
-    function createAction(label, action) {
-        const button = document.createElement("button");
+    Object.assign(panel.style, {
+      position: 'fixed',
+      right: '16px',
+      bottom: '16px',
+      zIndex: '2147483646',
+      background: '#142b20',
+      color: 'white',
+      padding: '12px 14px',
+      borderRadius: '12px',
+      width: '245px',
+      boxShadow: '0 4px 16px #0006',
+      font: '13px Arial, sans-serif'
+    });
 
-        button.type = "button";
-        button.textContent = label;
+    const header = document.createElement('strong');
+    header.textContent = 'KB 2.9.0';
 
-        Object.assign(button.style, {
-            display: "block",
-            width: "100%",
-            margin: "0 0 9px",
-            padding: "11px",
-            background: "#28533c",
-            color: "white",
-            border: "1px solid #357e59",
-            borderRadius: "8px",
-            textAlign: "left",
-            cursor: "pointer",
-            font: "13px Arial, sans-serif"
-        });
+    const status = document.createElement('p');
+    status.style.margin = '10px 0';
+    status.textContent = state.message;
+    statusNode = status;
 
-        button.addEventListener("click", action);
+    const toggle = document.createElement('button');
+    toggle.textContent = state.active ? 'Pausar' : 'Iniciar';
+    toggleNode = toggle;
 
-        return button;
-    }
+    Object.assign(toggle.style, {
+      background: '#32a96b',
+      color: '#102016',
+      border: 'none',
+      borderRadius: '6px',
+      padding: '8px 12px',
+      cursor: 'pointer'
+    });
 
-    function start() {
-        if (!document.body) return;
-        if (document.getElementById(BUTTON_ID)) return;
+    toggle.addEventListener('click', () => {
+      state.active = !state.active;
+      report(
+        state.active
+          ? 'Automacao ativada.'
+          : 'Automacao pausada.'
+      );
+    });
 
-        const opener = document.createElement("button");
+    panel.append(header, status, toggle);
+    document.body.appendChild(panel);
+  }
 
-        opener.id = BUTTON_ID;
-        opener.type = "button";
-        opener.textContent = "KB";
+  if (document.readyState === 'loading') {
+    document.addEventListener(
+      'DOMContentLoaded',
+      makePanel,
+      { once: true }
+    );
+  } else {
+    makePanel();
+  }
 
-        opener.setAttribute(
-            "aria-label",
-            "Abrir controles do Khan Stable"
-        );
-
-        Object.assign(opener.style, {
-            position: "fixed",
-            right: "20px",
-            bottom: "20px",
-            width: "52px",
-            height: "52px",
-            borderRadius: "50%",
-            background: "#13a66b",
-            color: "white",
-            border: "none",
-            font: "bold 16px Arial, sans-serif",
-            cursor: "pointer",
-            zIndex: "2147483646",
-            boxShadow: "0 4px 18px #0005"
-        });
-
-        const panel = document.createElement("div");
-        panel.id = PANEL_ID;
-
-        Object.assign(panel.style, {
-            position: "fixed",
-            right: "20px",
-            bottom: "84px",
-            width: "250px",
-            boxSizing: "border-box",
-            padding: "16px",
-            borderRadius: "14px",
-            background: "#17241d",
-            color: "white",
-            display: "none",
-            zIndex: "2147483646",
-            font: "13px Arial, sans-serif",
-            boxShadow: "0 4px 20px #0006"
-        });
-
-        const heading = document.createElement("strong");
-
-        heading.textContent = "KHAN STABLE 2.8.3";
-        heading.style.display = "block";
-        heading.style.marginBottom = "15px";
-
-        panel.appendChild(heading);
-
-        autoButton = createAction(
-            "Auto-avançar: DESLIGADO",
-            toggleAuto
-        );
-
-        panel.appendChild(autoButton);
-
-        panel.appendChild(
-            createAction("Avançar uma vez", () => {
-                advanceOnce(true);
-            })
-        );
-
-        panel.appendChild(
-            createAction("Alternar modo escuro", toggleDark)
-        );
-
-        panel.appendChild(
-            createAction("Parar automação", () => {
-                stopAuto();
-                notify("Automação interrompida.");
-            })
-        );
-
-        const footnote = document.createElement("small");
-
-        footnote.textContent =
-            "Avança apenas quando o botão de próxima questão " +
-            "está disponível. Não altera respostas ou notas.";
-
-        footnote.style.color = "#b7cfc0";
-        panel.appendChild(footnote);
-
-        opener.addEventListener("click", () => {
-            const open = panel.style.display === "none";
-
-            panel.style.display = open ? "block" : "none";
-
-            opener.setAttribute(
-                "aria-expanded",
-                String(open)
-            );
-        });
-
-        document.body.appendChild(panel);
-        document.body.appendChild(opener);
-
-        window.addEventListener(
-            "pagehide",
-            stopAuto,
-            { once: true }
-        );
-
-        console.info(
-            "[Khan Stable] Iniciado com sucesso."
-        );
-
-        notify("Khan Stable 2.8.3 carregado!");
-    }
-
-    if (document.readyState === "loading") {
-        document.addEventListener(
-            "DOMContentLoaded",
-            start,
-            { once: true }
-        );
-    } else {
-        start();
-    }
+  setInterval(tick, 700);
 })();
