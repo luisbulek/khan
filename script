@@ -1,501 +1,728 @@
 
  // ==UserScript==
- // @name         Khan Helper LuisBulek 3.4
+ // @name         Khan Helper LuisBulek 3.5
  // @namespace    https://github.com/luisbulek/khan
- // @version      3.4.0
- // @description  Reconhece algumas equacoes exponenciais e logaritmos, seleciona e verifica respostas.
+ // @version      3.5.0
+ // @description  Calcula crescimento exponencial, mostra respostas e verifica antes de avançar.
  // @match        https://*.khanacademy.org/*
  // @match        https://khanacademy.org/*
+ // @run-at       document-idle
  // @grant        none
- // @run-at       document-start
  // ==/UserScript==
 
 (() => {
   'use strict';
-  if (window.__LB_HELPER_34__) return;
-  window.__LB_HELPER_34__ = true;
+
+  const PANEL = 'lb35-panel';
+  if (document.getElementById(PANEL)) return;
 
   const st = {
-    running: false, phase: 'idle', since: 0, lastAction: 0,
-    message: 'Abra uma questão e clique em Analisar.',
-    identified: [], networkCorrect: null, lastQuestion: '',
-    originalRows: [], card: null, feedbackBefore: '',
-    verification: null, previousSignature: ''
+    automatico: false,
+    etapa: 'espera',
+    inicio: 0,
+    ultimoClique: 0,
+    resultado: null,
+    assinatura: '',
+    feedbackAnterior: '',
+    mensagem: 'Abra um exercício e clique em Analisar.'
   };
-  const log = (...args) => console.log('[Khan 3.4]', ...args);
-  const isVisible = el => !!(el && el.isConnected &&
-    el.getClientRects().length && !el.disabled &&
-    el.getAttribute('aria-disabled') !== 'true');
-  const clean = value => String(value || '').replace(/\u00a0/g, ' ')
-    .replace(/\*\*/g, '').replace(/,/g, '.').replace(/\s+/g, ' ')
-    .trim().toLowerCase();
 
-  function status(msg) {
-    if (st.message !== msg) log(msg);
-    st.message = msg;
-    const el = document.getElementById('lb34-status');
-    if (el) el.textContent = msg;
-    const start = document.getElementById('lb34-start');
-    if (start) start.textContent = st.running ? 'Pausar' : 'Iniciar';
-  }
-  function phase(name, msg) {
-    st.phase = name;
-    st.since = Date.now();
-    if (msg) status(msg);
-  }
+  const visivel = el => !!(
+    el &&
+    el.isConnected &&
+    el.getClientRects().length &&
+    !el.disabled &&
+    el.getAttribute('aria-disabled') !== 'true'
+  );
 
-  // Lê possíveis gabaritos sem alterar pedidos ou resultados do servidor.
-  function inspect(data) {
-    if (!data || typeof data !== 'object') return;
-    const visited = new WeakSet();
-    function scan(node, depth) {
-      if (!node || typeof node !== 'object' || depth > 11 || visited.has(node)) return;
-      visited.add(node);
-      const result = node?.attemptProblem?.result || node?.result;
-      const checked = result?.actionResults?.attemptCorrect ?? result?.attemptCorrect;
-      if (st.phase === 'checking' && typeof checked === 'boolean') {
-        st.verification = checked;
-      }
-      if (typeof node.itemData === 'string') {
-        try {
-          const question = JSON.parse(node.itemData)?.question;
-          for (const [key, widget] of Object.entries(question?.widgets || {})) {
-            if (widget?.type !== 'radio' || widget.options?.multipleSelect) continue;
-            if (question?.content && !question.content.includes('☃ ' + key)) continue;
-            const choices = widget.options?.choices;
-            if (!Array.isArray(choices)) continue;
-            const right = choices.filter(choice => choice?.correct === true);
-            if (right.length !== 1) continue;
-            st.identified.push({
-              all: choices.map(c => clean(c.content)),
-              right: clean(right[0].content)
-            });
-          }
-          st.identified = st.identified.slice(-15);
-        } catch (e) { log('Dados ignorados:', e.message); }
-      }
-      for (const val of Object.values(node)) scan(val, depth + 1);
+  function aviso(mensagem) {
+    st.mensagem = mensagem;
+
+    const el = document.getElementById('lb35-msg');
+    if (el) el.textContent = mensagem;
+
+    const info = document.getElementById('lb35-answer');
+
+    if (info) {
+      info.textContent = st.resultado
+        ? `Resposta: ${st.resultado.letra} — ${st.resultado.texto} | Cálculo: ${st.resultado.conta}`
+        : 'Resposta: ainda não identificada';
     }
-    scan(data, 0);
-  }
-  const originalFetch = window.fetch;
-  if (typeof originalFetch === 'function') {
-    window.fetch = async function(...args) {
-      const response = await originalFetch.apply(this, args);
-      try {
-        const url = args[0] instanceof Request ? args[0].url : String(args[0]);
-        const type = response.headers.get('content-type') || '';
-        if (response.ok && /json/i.test(type) &&
-            /graphql|assessment|attemptproblem/i.test(url)) {
-          response.clone().json().then(inspect).catch(() => {});
-        }
-      } catch (e) { log('Rede:', e.message); }
-      return response;
-    };
+
+    const btn = document.getElementById('lb35-run');
+
+    if (btn) {
+      btn.textContent = st.automatico
+        ? 'Pausar'
+        : 'Iniciar';
+    }
+
+    console.info('[Khan Helper 3.5]', mensagem);
   }
 
-  function getOptions() {
-    const groups = document.querySelectorAll(
-      '.perseus-widget-radio, .perseus-radio-option-list, [role="radiogroup"], fieldset'
+  function etapa(nome, mensagem) {
+    st.etapa = nome;
+    st.inicio = Date.now();
+
+    if (mensagem) aviso(mensagem);
+  }
+
+  function texto(el) {
+    return (
+      el?.innerText ||
+      el?.textContent ||
+      ''
+    ).trim();
+  }
+
+  function alternativas() {
+    const grupos = document.querySelectorAll(
+      '.perseus-widget-radio, ' +
+      '.perseus-radio-option-list, ' +
+      '[role="radiogroup"], fieldset'
     );
-    for (const group of groups) {
-      if (!isVisible(group) || group.closest('#lb34-panel')) continue;
-      for (const selector of ['.perseus-radio-option', 'li', 'label', '[role="radio"]']) {
-        const matches = [...group.querySelectorAll(selector)].filter(isVisible);
-        const outer = matches.filter(el => !matches.some(other =>
-          other !== el && other.contains(el)));
-        if (outer.length >= 2 && outer.length <= 8) {
-          return outer.map(el => ({el, text: el.innerText || el.textContent || ''}));
+
+    for (const grupo of grupos) {
+      if (!visivel(grupo)) continue;
+
+      if (grupo.closest('#' + PANEL)) {
+        continue;
+      }
+
+      for (const seletor of [
+        '.perseus-radio-option',
+        'li',
+        'label',
+        '[role="radio"]'
+      ]) {
+        const achados = [
+          ...grupo.querySelectorAll(seletor)
+        ].filter(visivel);
+
+        const externos = achados.filter(
+          el => !achados.some(
+            outro => outro !== el &&
+              outro.contains(el)
+          )
+        );
+
+        if (
+          externos.length >= 2 &&
+          externos.length <= 8
+        ) {
+          const linhas = externos.map(el => ({
+            el,
+            texto: texto(el)
+          }));
+
+          if (linhas.every(l => l.texto.length)) {
+            return linhas;
+          }
         }
       }
     }
-    // Interface moderna com marcadores A/B/C/D.
-    const byLetter = new Map();
-    const root = document.querySelector('main') || document.body;
-    if (!root) return [];
-    for (const marker of root.querySelectorAll('button, [role="radio"], label, [tabindex]')) {
-      if (!isVisible(marker) || marker.closest('#lb34-panel')) continue;
-      const label = (marker.getAttribute('aria-label') || marker.innerText || '').trim();
-      if (!/^[A-H]$/i.test(label)) continue;
-      let current = marker;
-      for (let i = 0; i < 4; i++) {
-        const parent = current.parentElement;
-        if (!parent) break;
-        current = parent;
-        const txt = (current.innerText || '').trim();
-        if (txt.length >= 3 && txt.length <= 180) break;
+
+    // Busca alternativas com letras A, B, C, D.
+    const raiz =
+      document.querySelector('main') ||
+      document.body;
+
+    const porLetra = new Map();
+
+    for (const marcador of raiz.querySelectorAll(
+      'button, [role="radio"], label, [tabindex]'
+    )) {
+      if (!visivel(marcador)) continue;
+
+      if (marcador.closest('#' + PANEL)) {
+        continue;
       }
-      const text = current.innerText || '';
-      if (text.length >= 3 && text.length < 200) {
-        byLetter.set(label.toUpperCase(), {el: current, text});
+
+      const letra = (
+        marcador.getAttribute('aria-label') ||
+        texto(marcador)
+      ).trim();
+
+      if (!/^[A-H]$/i.test(letra)) continue;
+
+      let linha = marcador;
+
+      for (
+        let passo = 0;
+        passo < 4 && linha.parentElement;
+        passo++
+      ) {
+        linha = linha.parentElement;
+
+        if (texto(linha).length >= 3) {
+          break;
+        }
+      }
+
+      const valor = texto(linha);
+
+      if (
+        valor.length >= 3 &&
+        valor.length < 180
+      ) {
+        porLetra.set(
+          letra.toUpperCase(),
+          { el: linha, texto: valor }
+        );
       }
     }
-    const rows = [...byLetter].sort((a,b) => a[0].localeCompare(b[0]))
-      .map(([,row]) => row);
-    return rows.length >= 2 && rows.length <= 8 &&
-      new Set(rows.map(r => r.el)).size === rows.length ? rows : [];
+
+    const linhas = [...porLetra]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([, valor]) => valor);
+
+    return (
+      linhas.length >= 2 &&
+      linhas.length <= 8 &&
+      new Set(linhas.map(l => l.el)).size === linhas.length
+    ) ? linhas : [];
   }
 
-  function readMathML(node) {
-    const tag = node.localName?.toLowerCase() || '';
-    if (tag === 'annotation') return '';
-    const children = [...node.children].filter(c => c.localName !== 'annotation');
-    const read = el => readMathML(el);
-    if (['mi','mn','mo','mtext'].includes(tag)) return node.textContent || '';
-    if (tag === 'mfrac' && children.length >= 2)
-      return '(' + read(children[0]) + ')/(' + read(children[1]) + ')';
-    if (tag === 'msup' && children.length >= 2)
-      return '(' + read(children[0]) + ')^(' + read(children[1]) + ')';
-    if (tag === 'msqrt') return 'sqrt(' + children.map(read).join('') + ')';
-    if (tag === 'semantics') return children.length ? read(children[0]) : '';
-    return children.map(read).join('');
+  function textoQuestao() {
+    const raiz =
+      document.querySelector('.perseus-renderer') ||
+      document.querySelector('main') ||
+      document.body;
+
+    return texto(raiz).slice(0, 16000);
   }
 
-  function equationSources() {
-    const root = document.querySelector('.perseus-renderer') ||
-      document.querySelector('main') || document.body;
-    if (!root) return [];
-    const found = [];
-    for (const node of root.querySelectorAll('annotation[encoding="application/x-tex"], script[type^="math/tex"]')) {
-      if (node.textContent) found.push(node.textContent);
+  function fontesFormula() {
+    const raiz =
+      document.querySelector('.perseus-renderer') ||
+      document.querySelector('main') ||
+      document.body;
+
+    const fontes = [texto(raiz)];
+
+    for (const el of raiz.querySelectorAll(
+      'annotation[encoding="application/x-tex"], ' +
+      'script[type^="math/tex"], ' +
+      '[data-tex], math[alttext], img[alt]'
+    )) {
+      const s =
+        el.getAttribute('data-tex') ||
+        el.getAttribute('alttext') ||
+        el.getAttribute('alt') ||
+        el.textContent;
+
+      if (s) fontes.push(s);
     }
-    for (const math of root.querySelectorAll('mjx-assistive-mml math, math')) {
-      const alt = math.getAttribute('alttext');
-      if (alt) found.push(alt);
-      const expr = readMathML(math);
-      if (expr) found.push(expr);
+
+    // Também tenta ler expressões em MathML.
+    for (const math of raiz.querySelectorAll('math')) {
+      let s = '';
+
+      for (const node of math.querySelectorAll(
+        'mi, mn, mo, mtext'
+      )) {
+        s += node.textContent;
+      }
+
+      if (s) fontes.push(s);
     }
-    for (const node of root.querySelectorAll('img[alt], [data-tex]')) {
-      const str = node.getAttribute('data-tex') || node.getAttribute('alt') || '';
-      if (str.includes('=') && str.includes('x')) found.push(str);
-    }
-    return [...new Set(found)].filter(x => x.includes('=') && /x/i.test(x));
+
+    return [...new Set(fontes)];
   }
 
-  // Interpretador numérico limitado: +, -, *, /, potências, frações, x.
-  // Não usa eval e só aceita os símbolos matemáticos listados.
-  function evaluateEquation(tex, xValue) {
-    const src = String(tex).replace(/\\left|\\right/g, '')
-      .replace(/\\(?:dfrac|tfrac)/g, '\\frac')
-      .replace(/\\(?:cdot|times)/g, '*')
-      .replace(/\\div/g, '/')
+  function interpretarModelo(source) {
+    const s = source
+      .replace(/\\left|\\right|\\,/g, '')
+      .replace(/\\times|\\cdot/g, '×')
+      .replace(/\{,\}/g, ',')
       .replace(/[−–]/g, '-')
-      .replace(/[×⋅]/g, '*').replace(/÷/g, '/')
-      .replace(/[\u2061\u2062]/g, '')
-      .replace(/\\(?:displaystyle|textstyle|scriptstyle|quad|qquad)/g, '')
-      .replace(/\\[,;! ]/g, '')
-      .replace(/\s+/g, '')
-      .replace(/,/g, '.');
-    const tokens = [];
-    const rx = /\\frac|\\sqrt|\d+(?:\.\d+)?|[xX]|[+\-*/^=(){}]/gy;
-    let pos = 0;
-    while (pos < src.length) {
-      rx.lastIndex = pos;
-      const m = rx.exec(src);
-      if (!m) return null;
-      tokens.push(m[0]);
-      pos = rx.lastIndex;
+      .replace(/\s+/g, '');
+
+    // Exemplo: C(t)=120×(1,08)^t
+    const m = s.match(
+      /[A-Za-z]\(t\)=(\d+(?:[.,]\d+)?)[×*x]\(?(\d+[.,]\d+)\)?(?:\^\{?t\}?|t)/i
+    );
+
+    if (!m) return null;
+
+    const inicial = Number(
+      m[1].replace(',', '.')
+    );
+
+    const fator = Number(
+      m[2].replace(',', '.')
+    );
+
+    if (inicial <= 0 || fator <= 0) {
+      return null;
     }
-    let i = 0;
-    const peek = () => tokens[i];
-    const take = token => {
-      if (peek() !== token) throw Error('Esperado ' + token);
-      i++;
-    };
-    function group() {
-      const opening = peek();
-      if (opening !== '{' && opening !== '(') throw Error('Grupo esperado');
-      i++;
-      const result = sum();
-      take(opening === '{' ? '}' : ')');
-      return result;
-    }
-    function atom() {
-      const t = peek();
-      if (t === '\\frac') {
-        i++;
-        return group() / group();
-      }
-      if (t === '\\sqrt') {
-        i++;
-        return Math.sqrt(group());
-      }
-      if (t === '{' || t === '(') return group();
-      if (t === 'x' || t === 'X') { i++; return xValue; }
-      if (/^\d/.test(t || '')) { i++; return Number(t); }
-      throw Error('Símbolo inesperado');
-    }
-    function power() {
-      let value = atom();
-      if (peek() === '^') {
-        i++;
-        let exponent;
-        if (peek() === '{' || peek() === '(') exponent = group();
-        else exponent = unary();
-        value = Math.pow(value, exponent);
-      }
-      return value;
-    }
-    function unary() {
-      if (peek() === '+') { i++; return unary(); }
-      if (peek() === '-') { i++; return -unary(); }
-      return power();
-    }
-    function product() {
-      let value = unary();
-      while (true) {
-        if (peek() === '*') { i++; value *= unary(); }
-        else if (peek() === '/') { i++; value /= unary(); }
-        else if (peek() === 'x' || peek() === 'X' || peek() === '(' ||
-                 peek() === '{' || peek() === '\\frac' ||
-                 /^\d/.test(peek() || '')) {
-          value *= unary();
-        } else break;
-      }
-      return value;
-    }
-    function sum() {
-      let value = product();
-      while (peek() === '+' || peek() === '-') {
-        const op = tokens[i++];
-        const right = product();
-        value += op === '+' ? right : -right;
-      }
-      return value;
-    }
-    try {
-      const left = sum();
-      take('=');
-      const right = sum();
-      if (i !== tokens.length || !Number.isFinite(left) || !Number.isFinite(right)) return null;
-      return Math.abs(left - right) <= 1e-7 * Math.max(1, Math.abs(left), Math.abs(right));
-    } catch { return null; }
+
+    return { inicial, fator };
   }
 
-  function numberFromChoice(text) {
-    const stripped = String(text).trim().replace(/^[A-H](?:\s*[.):])?\s*/i,'')
-      .replace(',', '.').trim();
-    if (/^[+-]?\d+(?:\.\d+)?$/.test(stripped)) return Number(stripped);
-    const fraction = stripped.match(/^([+-]?\d+)\s*\/\s*(\d+)$/);
-    if (fraction && Number(fraction[2]) !== 0) return Number(fraction[1]) / Number(fraction[2]);
+  function obterTempo(enunciado) {
+    const regras = [
+      /(?:no|para\s+o|ao)\s*(\d+)\s*[º°oª]?\s*dia\b/i,
+      /(?:ap[oó]s|em)\s*(\d+)\s*dias\b/i,
+      /\bt\s*=\s*(\d+)\b/i
+    ];
+
+    for (const re of regras) {
+      const match = enunciado.match(re);
+
+      if (match) {
+        return Number(match[1]);
+      }
+    }
+
     return null;
   }
 
-  function solveLogEquation(rows) {
-    const text = (document.querySelector('.perseus-renderer') ||
-      document.querySelector('main') || document.body)?.innerText || '';
-    const given = new Map([[10, 1]]);
-    for (const m of text.matchAll(/log\s*(\d+)\s*=\s*([+-]?\d+(?:[.,]\d+)?)/gi)) {
-      given.set(Number(m[1]), Number(m[2].replace(',', '.')));
-    }
-    if (given.has(5)) given.set(2, 1 - given.get(5));
-    const match = text.match(/(?:calcule|determine|valor de)[^\n]{0,100}?log\s*(\d+)/i);
+  function numeroAlternativa(raw) {
+    const s = raw
+      .replace(/^\s*[A-H][.):]?\s+/i, '')
+      .trim();
+
+    const match = s.match(
+      /[-+]?\d+(?:[.,]\d+)?\s*$/
+    );
+
     if (!match) return null;
-    let n = Number(match[1]);
-    if (!Number.isSafeInteger(n) || n < 1) return null;
-    let result = 0;
-    for (let p = 2; p * p <= n; p++) {
-      if (n % p !== 0) continue;
-      if (!given.has(p)) return null;
-      while (n % p === 0) { result += given.get(p); n /= p; }
-    }
-    if (n > 1) {
-      if (!given.has(n)) return null;
-      result += given.get(n);
-    }
-    const hits = rows.map((row,i) =>
-      numberFromChoice(row.text) !== null &&
-      Math.abs(numberFromChoice(row.text) - result) < 1e-6 ? i : -1
-    ).filter(i=>i>=0);
-    return hits.length === 1 ? hits[0] : null;
+
+    const numero = Number(
+      match[0].replace(',', '.')
+    );
+
+    return Number.isFinite(numero)
+      ? numero
+      : null;
   }
 
-  function identify(rows) {
-    const labels = rows.map(row => clean(row.text).replace(/^[a-h]\s+/,''));
-    for (const data of [...st.identified].reverse()) {
-      const overlap = labels.filter(label => data.all.some(choice =>
-        choice === label || choice.endsWith(' ' + label) || label.endsWith(' ' + choice))).length;
-      if (overlap < 2) continue;
-      const hits = labels.map((label, index) =>
-        label === data.right || data.right.endsWith(' ' + label) ||
-        label.endsWith(' ' + data.right) ? index : -1).filter(i=>i>=0);
-      if (hits.length === 1) return {index: hits[0], via: 'dados da questão'};
-    }
-    const answers = rows.map(row => numberFromChoice(row.text));
-    if (answers.every(v => v !== null)) {
-      for (const eq of equationSources()) {
-        const hits = answers.map((value, index) =>
-          evaluateEquation(eq, value) === true ? index : -1).filter(i => i >= 0);
-        if (hits.length === 1) return {index: hits[0], via: 'equação exponencial'};
-      }
-    }
-    const logIndex = solveLogEquation(rows);
-    if (logIndex !== null) return {index: logIndex, via: 'logaritmo'};
-    return null;
-  }
+  function identificar() {
+    const linhas = alternativas();
 
-  function choose(row) {
-    const el = row.el;
-    const target = el.querySelector('input[type="radio"], [role="radio"], label, button') || el;
-    target.click();
-  }
-  function restore() {
-    for (const item of st.originalRows) {
-      if (item.el.isConnected) {
-        if (item.value) item.el.style.setProperty('display', item.value, item.priority);
-        else item.el.style.removeProperty('display');
-      }
+    if (linhas.length < 2) {
+      return {
+        erro: 'Não encontrei as alternativas na página.'
+      };
     }
-    st.originalRows = [];
-    st.card?.remove();
-    st.card = null;
-  }
-  function showAsA(rows, index) {
-    restore();
-    // Primeiro seleciona a alternativa REAL, para manter a validação normal.
-    choose(rows[index]);
-    const target = rows[0].el;
-    if (!target.parentElement) return;
-    const card = document.createElement(target.tagName.toLowerCase() === 'li' ? 'li' : 'div');
-    card.id = 'lb34-card';
-    card.style.cssText = 'padding:14px;margin:8px 0;background:#e5f6eb;'+
-      'border:2px solid #168657;border-radius:10px;color:#143b24;'+
-      'font:16px Arial,sans-serif;cursor:pointer;';
-    card.textContent = 'A  ·  ' + rows[index].text.replace(/^\s*[A-H](?:[.):])?\s*/i,'').trim();
-    card.addEventListener('click', () => choose(rows[index]));
-    target.parentElement.insertBefore(card, target);
-    st.card = card;
-    st.originalRows = rows.map(row => ({
-      el: row.el,
-      value: row.el.style.getPropertyValue('display'),
-      priority: row.el.style.getPropertyPriority('display')
-    }));
-    rows.forEach(row => row.el.style.setProperty('display','none','important'));
-  }
 
-  function findButton(ids, texts) {
-    for (const id of ids) {
-      const el = document.querySelector(`[data-testid="${id}"]`);
-      if (isVisible(el)) return el;
+    const enunciado = textoQuestao();
+    const tempo = obterTempo(enunciado);
+
+    if (tempo === null) {
+      return {
+        erro: 'Encontrei as alternativas, mas não identifiquei o dia solicitado.'
+      };
     }
-    const accepted = new Set(texts);
-    return [...document.querySelectorAll('button')].find(el =>
-      isVisible(el) && !el.closest('#lb34-panel') &&
-      accepted.has((el.innerText || el.textContent || '').trim().toLowerCase())) || null;
-  }
-  const checkButton = () => findButton(['exercise-check-answer'],
-    ['verificar', 'verificar resposta', 'conferir', 'check answer']);
-  const nextButton = () => findButton(['exercise-next-question','exercise-next-question-button'],
-    ['próxima questão','próximo','continuar','next question']);
 
-  function feedback() {
-    return [...document.querySelectorAll('[role="alert"], [role="status"], [aria-live]')]
-      .filter(isVisible).map(el => el.innerText || '').join(' ');
-  }
-  function signature(rows) {
-    const q = (document.querySelector('.perseus-renderer') ||
-      document.querySelector('main') || document.body)?.innerText || '';
-    return clean(q).slice(0,800) + ':' + rows.map(r=>clean(r.text)).join('|');
-  }
-  function analyze() {
-    restore();
-    const rows = getOptions();
-    if (rows.length < 2) return status('Não consegui identificar as alternativas na página.');
-    const answer = identify(rows);
-    if (!answer) return status(`${rows.length} alternativas detectadas. Fórmulas lidas: ${equationSources().length}. Sem solução para este formato.`);
-    st.previousSignature = signature(rows);
-    st.verification = null;
-    showAsA(rows, answer.index);
-    st.lastAction = Date.now();
-    phase('selected', `Resposta identificada (${answer.via}) e apresentada como A.`);
-  }
+    let modelo = null;
 
-  function tick() {
-    if (!st.running || document.visibilityState === 'hidden') return;
-    const now = Date.now();
-    if (now - st.lastAction < 1000) return;
-    if (st.phase === 'idle') { analyze(); return; }
-    if (st.phase === 'selected') {
-      const btn = checkButton();
-      if (!btn) return;
-      st.feedbackBefore = feedback();
-      st.lastAction = now;
-      phase('checking', 'Verificando a resposta...');
-      btn.click();
-    } else if (st.phase === 'checking') {
-      const current = feedback();
-      const confirmedByUI = current !== st.feedbackBefore &&
-        /resposta correta|muito bem|parab[eé]ns|mandou bem|voc[eê] acertou|correct answer/i.test(current);
-      if (st.verification === true || confirmedByUI) {
-        phase('correct', 'Acerto confirmado. Preparando próxima questão...');
-      } else if (st.verification === false || now - st.since > 15000) {
-        st.running = false;
-        restore();
-        phase('paused', 'Sem confirmação de acerto. Automação pausada.');
-      }
-    } else if (st.phase === 'correct') {
-      const btn = nextButton();
-      if (!btn) return;
-      restore();
-      st.lastAction = now;
-      phase('transition', 'Avançando para a próxima questão...');
-      btn.click();
-    } else if (st.phase === 'transition') {
-      const rows = getOptions();
-      if (rows.length >= 2 && signature(rows) !== st.previousSignature) {
-        phase('idle', 'Nova questão detectada.');
-      } else if (now - st.since > 20000) {
-        st.running = false;
-        phase('paused', 'Não consegui identificar a próxima questão.');
-      }
+    for (const fonte of fontesFormula()) {
+      modelo = interpretarModelo(fonte);
+
+      if (modelo) break;
     }
-  }
-  function panel() {
-    if (!document.body || document.getElementById('lb34-panel')) return;
-    const p = document.createElement('aside');
-    p.id = 'lb34-panel';
-    p.style.cssText = 'position:fixed;top:65px;right:16px;z-index:2147483646;'+
-      'background:#123225;color:white;padding:14px;border-radius:12px;'+
-      'width:265px;font:13px Arial,sans-serif;box-shadow:0 4px 18px #0006;';
-    const title = document.createElement('strong');
-    title.textContent = 'KHAN HELPER 3.4';
-    const line = document.createElement('p');
-    line.id = 'lb34-status';
-    line.textContent = st.message;
-    const button = (name, action) => {
-      const b = document.createElement('button');
-      b.textContent = name;
-      b.style.cssText = 'padding:9px;margin:0 6px 6px 0;border:0;'+
-        'border-radius:7px;background:#20ae72;color:#082a19;cursor:pointer;';
-      b.addEventListener('click', action);
-      return b;
+
+    if (!modelo) {
+      return {
+        erro: 'Encontrei as alternativas, mas não consegui ler a fórmula C(t).'
+      };
+    }
+
+    const calculado =
+      modelo.inicial *
+      Math.pow(modelo.fator, tempo);
+
+    const lista = linhas
+      .map((linha, indice) => ({
+        indice,
+        valor: numeroAlternativa(linha.texto),
+        linha
+      }))
+      .filter(a => a.valor !== null);
+
+    if (lista.length !== linhas.length) {
+      return {
+        erro: 'Não consegui ler os valores das alternativas.'
+      };
+    }
+
+    lista.sort(
+      (a, b) =>
+        Math.abs(a.valor - calculado) -
+        Math.abs(b.valor - calculado)
+    );
+
+    const tolerancia = Math.max(
+      0.15,
+      Math.abs(calculado) * 0.005
+    );
+
+    if (
+      lista.length < 2 ||
+      Math.abs(lista[0].valor - calculado) > tolerancia ||
+      Math.abs(lista[1].valor - calculado) -
+      Math.abs(lista[0].valor - calculado) < 0.1
+    ) {
+      return {
+        erro: 'Nenhuma alternativa corresponde de forma confiável ao cálculo.'
+      };
+    }
+
+    const melhor = lista[0];
+
+    return {
+      indice: melhor.indice,
+
+      letra: String.fromCharCode(
+        65 + melhor.indice
+      ),
+
+      texto: melhor.linha.texto
+        .replace(/^\s*[A-H][.):]?\s+/i, '')
+        .trim(),
+
+      linha: melhor.linha,
+
+      conta:
+        `${modelo.inicial} × ${modelo.fator}^${tempo} ≈ ` +
+        calculado.toFixed(2).replace('.', ',')
     };
-    const start = button('Iniciar', () => {
-      st.running = !st.running;
-      if (st.running && st.phase === 'paused') phase('idle', 'Automação reiniciada.');
-      if (!st.running) { restore(); phase('idle', 'Pausado.'); }
-      status(st.running ? 'Automação ligada.' : 'Automação desligada.');
-    });
-    start.id = 'lb34-start';
-    const scan = button('Analisar', () => analyze());
-    const reset = button('Restaurar', () => {
-      st.running = false;
-      restore();
-      phase('idle','Interface original restaurada.');
-    });
-    p.append(title,line,start,scan,reset);
-    document.body.appendChild(p);
   }
+
+  function selecionar(linha) {
+    const el = linha.el;
+
+    const candidatos = [
+      el.querySelector('[role="radio"]'),
+      el.querySelector('label'),
+      el.querySelector('button'),
+      el.querySelector('input[type="radio"]'),
+      el
+    ];
+
+    const alvo = candidatos.find(visivel);
+
+    if (!alvo) return false;
+
+    alvo.click();
+    return true;
+  }
+
+  function procurarBotao(ids, rotulos) {
+    for (const id of ids) {
+      const botao = document.querySelector(
+        `[data-testid="${id}"]`
+      );
+
+      if (visivel(botao)) return botao;
+    }
+
+    return [
+      ...document.querySelectorAll('button')
+    ].find(el =>
+      visivel(el) &&
+      !el.closest('#' + PANEL) &&
+      rotulos.some(
+        s => texto(el).toLowerCase() === s
+      )
+    ) || null;
+  }
+
+  const botaoVerificar = () => procurarBotao(
+    ['exercise-check-answer'],
+    [
+      'verificar',
+      'verificar resposta',
+      'conferir',
+      'check answer'
+    ]
+  );
+
+  const botaoProximo = () => procurarBotao(
+    [
+      'exercise-next-question',
+      'exercise-next-question-button'
+    ],
+    [
+      'próxima questão',
+      'próximo',
+      'continuar',
+      'next question'
+    ]
+  );
+
+  function textoFeedback() {
+    return [
+      ...document.querySelectorAll(
+        '[role="alert"], [role="status"], [aria-live]'
+      )
+    ]
+      .filter(visivel)
+      .map(texto)
+      .join(' ');
+  }
+
+  function assinatura() {
+    return textoQuestao().slice(0, 1000) +
+      '||' +
+      alternativas()
+        .map(l => l.texto)
+        .join('|');
+  }
+
+  function analisar() {
+    const achado = identificar();
+
+    if (achado.erro) {
+      st.resultado = null;
+      aviso(achado.erro);
+      return false;
+    }
+
+    st.resultado = achado;
+    st.assinatura = assinatura();
+
+    etapa(
+      'encontrada',
+      'Resposta encontrada. Clique em Iniciar para selecionar e verificar.'
+    );
+
+    return true;
+  }
+
+  function pausar(mensagem) {
+    st.automatico = false;
+    etapa('pausada', mensagem);
+  }
+
+  function passo() {
+    if (
+      !st.automatico ||
+      document.visibilityState === 'hidden'
+    ) {
+      return;
+    }
+
+    const agora = Date.now();
+
+    if (agora - st.ultimoClique < 1300) {
+      return;
+    }
+
+    if (
+      st.etapa === 'espera' ||
+      st.etapa === 'pausada'
+    ) {
+      if (!analisar()) {
+        return pausar(st.mensagem);
+      }
+    }
+
+    if (st.etapa === 'encontrada') {
+      if (!selecionar(st.resultado.linha)) {
+        return pausar(
+          'Não consegui clicar na alternativa correta.'
+        );
+      }
+
+      st.ultimoClique = agora;
+
+      etapa(
+        'selecionada',
+        `Selecionei ${st.resultado.letra} — ${st.resultado.texto}.`
+      );
+
+      return;
+    }
+
+    if (st.etapa === 'selecionada') {
+      const btn = botaoVerificar();
+
+      if (!btn) {
+        if (agora - st.inicio > 9000) {
+          pausar(
+            'Resposta selecionada, mas não encontrei o botão Verificar.'
+          );
+        }
+
+        return;
+      }
+
+      st.feedbackAnterior = textoFeedback();
+      st.ultimoClique = agora;
+
+      etapa(
+        'verificando',
+        'Resposta enviada; aguardando confirmação do site.'
+      );
+
+      btn.click();
+      return;
+    }
+
+    if (st.etapa === 'verificando') {
+      const atual = textoFeedback();
+
+      const correto =
+        atual !== st.feedbackAnterior &&
+        /(?:resposta correta|correto!|muito bem|parab[eé]ns|mandou bem|voc[eê] acertou|correct answer)/i.test(atual);
+
+      if (correto) {
+        etapa(
+          'correta',
+          'Acerto confirmado na interface.'
+        );
+      } else if (agora - st.inicio > 15000) {
+        pausar(
+          'Resposta enviada, mas não consegui confirmar o acerto. Não vou pular.'
+        );
+      }
+
+      return;
+    }
+
+    if (st.etapa === 'correta') {
+      const btn = botaoProximo();
+
+      if (!btn) return;
+
+      st.ultimoClique = agora;
+
+      etapa(
+        'mudando',
+        'Acerto confirmado. Indo à próxima questão.'
+      );
+
+      btn.click();
+      return;
+    }
+
+    if (st.etapa === 'mudando') {
+      if (assinatura() !== st.assinatura) {
+        st.resultado = null;
+
+        etapa(
+          'espera',
+          'Próxima questão carregada.'
+        );
+      } else if (agora - st.inicio > 20000) {
+        pausar(
+          'Não consegui detectar a próxima questão.'
+        );
+      }
+    }
+  }
+
+  function painel() {
+    if (
+      !document.body ||
+      document.getElementById(PANEL)
+    ) {
+      return;
+    }
+
+    const p = document.createElement('section');
+    p.id = PANEL;
+
+    p.style.cssText =
+      'position:fixed;right:14px;top:72px;' +
+      'z-index:2147483646;background:#123326;' +
+      'color:white;padding:14px;border-radius:12px;' +
+      'width:290px;box-shadow:0 5px 22px #0006;' +
+      'font:13px Arial,sans-serif;';
+
+    const titulo = document.createElement('strong');
+    titulo.textContent = 'KHAN HELPER 3.5';
+
+    const resposta = document.createElement('p');
+    resposta.id = 'lb35-answer';
+
+    resposta.style.cssText =
+      'font-weight:bold;color:#9afab9;' +
+      'line-height:1.5;';
+
+    const msg = document.createElement('p');
+    msg.id = 'lb35-msg';
+    msg.style.lineHeight = '1.5';
+
+    function botao(rotulo, acao) {
+      const b = document.createElement('button');
+
+      b.textContent = rotulo;
+
+      b.style.cssText =
+        'border:0;border-radius:7px;' +
+        'background:#25be78;color:#052516;' +
+        'padding:9px 11px;margin:0 7px 6px 0;' +
+        'cursor:pointer;';
+
+      b.addEventListener('click', acao);
+      return b;
+    }
+
+    const analisarBtn = botao(
+      'Analisar',
+      analisar
+    );
+
+    const iniciarBtn = botao(
+      'Iniciar',
+      () => {
+        st.automatico = !st.automatico;
+
+        if (
+          st.automatico &&
+          ['pausada', 'espera'].includes(st.etapa)
+        ) {
+          etapa('espera');
+        }
+
+        aviso(
+          st.automatico
+            ? 'Automação iniciada.'
+            : 'Automação pausada.'
+        );
+      }
+    );
+
+    iniciarBtn.id = 'lb35-run';
+
+    const pararBtn = botao(
+      'Parar',
+      () => pausar('Automação interrompida.')
+    );
+
+    p.append(
+      titulo,
+      resposta,
+      msg,
+      analisarBtn,
+      iniciarBtn,
+      pararBtn
+    );
+
+    document.body.appendChild(p);
+    aviso(st.mensagem);
+  }
+
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded',panel,{once:true});
-  } else panel();
-  const timer = setInterval(() => {
-    try { tick(); } catch(e) {
-      st.running = false;
-      restore();
-      console.error('[Khan 3.4]',e);
-      phase('paused','Erro: '+e.message);
+    document.addEventListener(
+      'DOMContentLoaded',
+      painel,
+      { once: true }
+    );
+  } else {
+    painel();
+  }
+
+  setInterval(() => {
+    try {
+      passo();
+    } catch (e) {
+      console.error('[Khan Helper 3.5]', e);
+      pausar('Erro: ' + e.message);
     }
   }, 900);
-  window.addEventListener('pagehide',() => { clearInterval(timer); restore(); },{once:true});
 })();
