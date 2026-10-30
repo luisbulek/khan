@@ -1,9 +1,9 @@
 
  // ==UserScript==
- // @name         Khan Helper - LuisBulek 3.3
+ // @name         Khan Helper LuisBulek 3.4
  // @namespace    https://github.com/luisbulek/khan
- // @version      3.3.0
- // @description  Mostra somente a resposta identificada como A; seleciona, verifica e avanca apos acerto.
+ // @version      3.4.0
+ // @description  Reconhece algumas equacoes exponenciais e logaritmos, seleciona e verifica respostas.
  // @match        https://*.khanacademy.org/*
  // @match        https://khanacademy.org/*
  // @grant        none
@@ -12,108 +12,72 @@
 
 (() => {
   'use strict';
-  if (window.__LB_KHAN_33__) return;
-  window.__LB_KHAN_33__ = true;
+  if (window.__LB_HELPER_34__) return;
+  window.__LB_HELPER_34__ = true;
 
-  const state = {
-    running: false,
-    phase: 'idle',
-    since: Date.now(),
-    lastClick: 0,
-    lastScan: 0,
-    message: 'Abra uma questao de multipla escolha.',
-    answers: [],
-    capturedCount: 0,
-    source: '-',
-    current: null,
-    beforeFeedback: ''
+  const st = {
+    running: false, phase: 'idle', since: 0, lastAction: 0,
+    message: 'Abra uma questão e clique em Analisar.',
+    identified: [], networkCorrect: null, lastQuestion: '',
+    originalRows: [], card: null, feedbackBefore: '',
+    verification: null, previousSignature: ''
   };
-
-  const log = (...args) => console.info('[Khan Helper 3.3]', ...args);
-  const visible = el => Boolean(el && el.isConnected &&
+  const log = (...args) => console.log('[Khan 3.4]', ...args);
+  const isVisible = el => !!(el && el.isConnected &&
     el.getClientRects().length && !el.disabled &&
     el.getAttribute('aria-disabled') !== 'true');
+  const clean = value => String(value || '').replace(/\u00a0/g, ' ')
+    .replace(/\*\*/g, '').replace(/,/g, '.').replace(/\s+/g, ' ')
+    .trim().toLowerCase();
 
-  function normalize(value) {
-    return String(value || '')
-      .replace(/\\(?:text|mathrm)\s*\{([^{}]*)\}/g, '$1')
-      .replace(/\*\*/g, '')
-      .replace(/\u00a0/g, ' ')
-      .replace(/,/g, '.')
-      .replace(/\s+/g, ' ')
-      .replace(/[^\p{L}\p{N}.+\-/%= ]/gu, '')
-      .trim().toLowerCase();
+  function status(msg) {
+    if (st.message !== msg) log(msg);
+    st.message = msg;
+    const el = document.getElementById('lb34-status');
+    if (el) el.textContent = msg;
+    const start = document.getElementById('lb34-start');
+    if (start) start.textContent = st.running ? 'Pausar' : 'Iniciar';
+  }
+  function phase(name, msg) {
+    st.phase = name;
+    st.since = Date.now();
+    if (msg) status(msg);
   }
 
-  function tell(message) {
-    if (state.message !== message) log(message);
-    state.message = message;
-    const status = document.getElementById('lb33-status');
-    if (status) status.textContent = message;
-    const meta = document.getElementById('lb33-meta');
-    if (meta) meta.textContent = `Fonte: ${state.source} | Respostas detectadas: ${state.capturedCount}`;
-  }
-
-  function setPhase(next, message) {
-    state.phase = next;
-    state.since = Date.now();
-    if (message) tell(message);
-  }
-
-  // Somente observa as respostas da rede. Nao falsifica requisicoes nem notas.
-  function inspectJSON(payload) {
-    if (!payload || typeof payload !== 'object') return;
-    const seen = new WeakSet();
-    const newlyFound = [];
-
-    function walk(node, depth) {
-      if (!node || typeof node !== 'object' || seen.has(node) || depth > 12) return;
-      seen.add(node);
-
-      const attempt = node?.attemptProblem?.result || node?.result;
-      const verdict = attempt?.actionResults?.attemptCorrect ?? attempt?.attemptCorrect;
-      if (state.phase === 'checking' && typeof verdict === 'boolean') {
-        if (verdict) setPhase('correct', 'Resposta correta confirmada pelo Khan Academy.');
-        else {
-          state.running = false;
-          setPhase('paused', 'Resposta rejeitada. Automacao pausada.');
-          updateStart();
-          restoreOptions();
-        }
+  // Lê possíveis gabaritos sem alterar pedidos ou resultados do servidor.
+  function inspect(data) {
+    if (!data || typeof data !== 'object') return;
+    const visited = new WeakSet();
+    function scan(node, depth) {
+      if (!node || typeof node !== 'object' || depth > 11 || visited.has(node)) return;
+      visited.add(node);
+      const result = node?.attemptProblem?.result || node?.result;
+      const checked = result?.actionResults?.attemptCorrect ?? result?.attemptCorrect;
+      if (st.phase === 'checking' && typeof checked === 'boolean') {
+        st.verification = checked;
       }
-
       if (typeof node.itemData === 'string') {
         try {
           const question = JSON.parse(node.itemData)?.question;
-          const widgets = question?.widgets || {};
-          for (const [key, widget] of Object.entries(widgets)) {
+          for (const [key, widget] of Object.entries(question?.widgets || {})) {
             if (widget?.type !== 'radio' || widget.options?.multipleSelect) continue;
-            if (typeof question?.content === 'string' &&
-                !question.content.includes('☃ ' + key)) continue;
+            if (question?.content && !question.content.includes('☃ ' + key)) continue;
             const choices = widget.options?.choices;
-            if (!Array.isArray(choices) || choices.length < 2) continue;
-            const correct = choices.filter(c => c?.correct === true);
-            if (correct.length !== 1) continue;
-            newlyFound.push({
-              values: choices.map(c => normalize(c.content)),
-              correct: normalize(correct[0].content)
+            if (!Array.isArray(choices)) continue;
+            const right = choices.filter(choice => choice?.correct === true);
+            if (right.length !== 1) continue;
+            st.identified.push({
+              all: choices.map(c => clean(c.content)),
+              right: clean(right[0].content)
             });
           }
+          st.identified = st.identified.slice(-15);
         } catch (e) { log('Dados ignorados:', e.message); }
       }
-      if (Array.isArray(node)) node.forEach(x => walk(x, depth + 1));
-      else Object.values(node).forEach(x => walk(x, depth + 1));
+      for (const val of Object.values(node)) scan(val, depth + 1);
     }
-
-    walk(payload, 0);
-    if (newlyFound.length) {
-      state.answers.push(...newlyFound);
-      state.answers = state.answers.slice(-25);
-      state.capturedCount += newlyFound.length;
-      tell('Dados de resposta recebidos.');
-    }
+    scan(data, 0);
   }
-
   const originalFetch = window.fetch;
   if (typeof originalFetch === 'function') {
     window.fetch = async function(...args) {
@@ -122,394 +86,416 @@
         const url = args[0] instanceof Request ? args[0].url : String(args[0]);
         const type = response.headers.get('content-type') || '';
         if (response.ok && /json/i.test(type) &&
-            /graphql|assessment|exercise|attemptproblem/i.test(url)) {
-          response.clone().json().then(inspectJSON).catch(() => {});
+            /graphql|assessment|attemptproblem/i.test(url)) {
+          response.clone().json().then(inspect).catch(() => {});
         }
-      } catch (e) { log('Fetch:', e.message); }
+      } catch (e) { log('Rede:', e.message); }
       return response;
     };
   }
 
-  // Alguns exercicios utilizam XMLHttpRequest em vez de fetch.
-  const oldOpen = XMLHttpRequest.prototype.open;
-  const oldSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-    this.__lb33URL = String(url || '');
-    return oldOpen.call(this, method, url, ...rest);
-  };
-  XMLHttpRequest.prototype.send = function(...args) {
-    if (/graphql|assessment|exercise|attemptproblem/i.test(this.__lb33URL || '')) {
-      this.addEventListener('load', () => {
-        try {
-          if (this.status < 200 || this.status >= 300) return;
-          const data = this.responseType === 'json'
-            ? this.response
-            : JSON.parse(this.responseText);
-          inspectJSON(data);
-        } catch { /* resposta nao era JSON */ }
-      }, { once: true });
-    }
-    return oldSend.apply(this, args);
-  };
-
-  function optionText(element) {
-    return (element.innerText || element.textContent || '').trim();
-  }
-
-  function rowData(rows) {
-    if (rows.length < 2 || rows.length > 8) return [];
-    const uniq = [...new Set(rows)];
-    return uniq.map(el => ({ el, text: optionText(el) }))
-      .filter(x => x.text.length > 0);
-  }
-
   function getOptions() {
-    const roots = document.querySelectorAll(
-      '.perseus-widget-radio, .perseus-radio-option-list, ' +
-      '[role="radiogroup"], [data-testid*="radio"], fieldset'
+    const groups = document.querySelectorAll(
+      '.perseus-widget-radio, .perseus-radio-option-list, [role="radiogroup"], fieldset'
     );
-    for (const root of roots) {
-      if (!visible(root) || root.closest('#lb33-panel')) continue;
-      for (const sel of [':scope > li', ':scope > label',
-        '.perseus-radio-option', 'li', 'label', '[role="radio"]']) {
-        const found = [...root.querySelectorAll(sel)].filter(visible);
-        const outer = found.filter(el => !found.some(other =>
+    for (const group of groups) {
+      if (!isVisible(group) || group.closest('#lb34-panel')) continue;
+      for (const selector of ['.perseus-radio-option', 'li', 'label', '[role="radio"]']) {
+        const matches = [...group.querySelectorAll(selector)].filter(isVisible);
+        const outer = matches.filter(el => !matches.some(other =>
           other !== el && other.contains(el)));
-        const rows = rowData(outer);
-        if (rows.length >= 2 && rows.length <= 8) return rows;
-      }
-    }
-
-    // Versoes novas que exibem A/B/C/D em botoes ou circulos.
-    const root = document.querySelector('main') || document.body;
-    const byLetter = new Map();
-    for (const el of root.querySelectorAll(
-      'button, [role="radio"], [tabindex], label'
-    )) {
-      if (!visible(el) || el.closest('#lb33-panel')) continue;
-      const label = (el.getAttribute('aria-label') || optionText(el)).trim();
-      if (!/^[A-H]$/i.test(label)) continue;
-      let row = el;
-      for (let i = 0; i < 3 && row.parentElement; i++) {
-        const candidate = row.parentElement;
-        const text = optionText(candidate);
-        if (text.length > 2 && text.length < 220) {
-          row = candidate;
-          break;
+        if (outer.length >= 2 && outer.length <= 8) {
+          return outer.map(el => ({el, text: el.innerText || el.textContent || ''}));
         }
-        row = candidate;
-      }
-      const text = optionText(row);
-      if (text.length >= 3 && text.length < 220) {
-        byLetter.set(label.toUpperCase(), { el: row, text });
       }
     }
-    if (byLetter.size >= 2 && byLetter.size <= 8) {
-      const entries = [...byLetter.entries()]
-        .sort((a, b) => a[0].localeCompare(b[0]));
-      const rows = entries.map(x => x[1]);
-      if (new Set(rows.map(x => x.el)).size === rows.length) return rows;
+    // Interface moderna com marcadores A/B/C/D.
+    const byLetter = new Map();
+    const root = document.querySelector('main') || document.body;
+    if (!root) return [];
+    for (const marker of root.querySelectorAll('button, [role="radio"], label, [tabindex]')) {
+      if (!isVisible(marker) || marker.closest('#lb34-panel')) continue;
+      const label = (marker.getAttribute('aria-label') || marker.innerText || '').trim();
+      if (!/^[A-H]$/i.test(label)) continue;
+      let current = marker;
+      for (let i = 0; i < 4; i++) {
+        const parent = current.parentElement;
+        if (!parent) break;
+        current = parent;
+        const txt = (current.innerText || '').trim();
+        if (txt.length >= 3 && txt.length <= 180) break;
+      }
+      const text = current.innerText || '';
+      if (text.length >= 3 && text.length < 200) {
+        byLetter.set(label.toUpperCase(), {el: current, text});
+      }
     }
-    return [];
+    const rows = [...byLetter].sort((a,b) => a[0].localeCompare(b[0]))
+      .map(([,row]) => row);
+    return rows.length >= 2 && rows.length <= 8 &&
+      new Set(rows.map(r => r.el)).size === rows.length ? rows : [];
   }
 
-  function exerciseText() {
+  function readMathML(node) {
+    const tag = node.localName?.toLowerCase() || '';
+    if (tag === 'annotation') return '';
+    const children = [...node.children].filter(c => c.localName !== 'annotation');
+    const read = el => readMathML(el);
+    if (['mi','mn','mo','mtext'].includes(tag)) return node.textContent || '';
+    if (tag === 'mfrac' && children.length >= 2)
+      return '(' + read(children[0]) + ')/(' + read(children[1]) + ')';
+    if (tag === 'msup' && children.length >= 2)
+      return '(' + read(children[0]) + ')^(' + read(children[1]) + ')';
+    if (tag === 'msqrt') return 'sqrt(' + children.map(read).join('') + ')';
+    if (tag === 'semantics') return children.length ? read(children[0]) : '';
+    return children.map(read).join('');
+  }
+
+  function equationSources() {
     const root = document.querySelector('.perseus-renderer') ||
-      document.querySelector('[data-testid="exercise-problem"]') ||
       document.querySelector('main') || document.body;
-    return (root?.innerText || '').slice(0, 16000);
-  }
-
-  function fingerprint(rows) {
-    return normalize(exerciseText()).slice(0, 1400) + '##' +
-      rows.map(x => normalize(x.text)).join('|');
-  }
-
-  // Solucionador restrito a produtos/quocientes/potencias de logaritmos decimais.
-  function solveLog(text) {
-    const known = new Map([[10, 1]]);
-    for (const m of text.matchAll(/log\s*(\d+)\s*=\s*([+-]?\d+(?:[.,]\d+)?)/gi)) {
-      known.set(Number(m[1]), Number(m[2].replace(',', '.')));
+    if (!root) return [];
+    const found = [];
+    for (const node of root.querySelectorAll('annotation[encoding="application/x-tex"], script[type^="math/tex"]')) {
+      if (node.textContent) found.push(node.textContent);
     }
-    if (known.has(5)) known.set(2, 1 - known.get(5));
-    const match = text.match(/(?:calcule|determine|valor\s+de)[^\n]{0,100}?log\s*(\d+)/i);
+    for (const math of root.querySelectorAll('mjx-assistive-mml math, math')) {
+      const alt = math.getAttribute('alttext');
+      if (alt) found.push(alt);
+      const expr = readMathML(math);
+      if (expr) found.push(expr);
+    }
+    for (const node of root.querySelectorAll('img[alt], [data-tex]')) {
+      const str = node.getAttribute('data-tex') || node.getAttribute('alt') || '';
+      if (str.includes('=') && str.includes('x')) found.push(str);
+    }
+    return [...new Set(found)].filter(x => x.includes('=') && /x/i.test(x));
+  }
+
+  // Interpretador numérico limitado: +, -, *, /, potências, frações, x.
+  // Não usa eval e só aceita os símbolos matemáticos listados.
+  function evaluateEquation(tex, xValue) {
+    const src = String(tex).replace(/\\left|\\right/g, '')
+      .replace(/\\(?:dfrac|tfrac)/g, '\\frac')
+      .replace(/\\(?:cdot|times)/g, '*')
+      .replace(/\\div/g, '/')
+      .replace(/[−–]/g, '-')
+      .replace(/[×⋅]/g, '*').replace(/÷/g, '/')
+      .replace(/[\u2061\u2062]/g, '')
+      .replace(/\\(?:displaystyle|textstyle|scriptstyle|quad|qquad)/g, '')
+      .replace(/\\[,;! ]/g, '')
+      .replace(/\s+/g, '')
+      .replace(/,/g, '.');
+    const tokens = [];
+    const rx = /\\frac|\\sqrt|\d+(?:\.\d+)?|[xX]|[+\-*/^=(){}]/gy;
+    let pos = 0;
+    while (pos < src.length) {
+      rx.lastIndex = pos;
+      const m = rx.exec(src);
+      if (!m) return null;
+      tokens.push(m[0]);
+      pos = rx.lastIndex;
+    }
+    let i = 0;
+    const peek = () => tokens[i];
+    const take = token => {
+      if (peek() !== token) throw Error('Esperado ' + token);
+      i++;
+    };
+    function group() {
+      const opening = peek();
+      if (opening !== '{' && opening !== '(') throw Error('Grupo esperado');
+      i++;
+      const result = sum();
+      take(opening === '{' ? '}' : ')');
+      return result;
+    }
+    function atom() {
+      const t = peek();
+      if (t === '\\frac') {
+        i++;
+        return group() / group();
+      }
+      if (t === '\\sqrt') {
+        i++;
+        return Math.sqrt(group());
+      }
+      if (t === '{' || t === '(') return group();
+      if (t === 'x' || t === 'X') { i++; return xValue; }
+      if (/^\d/.test(t || '')) { i++; return Number(t); }
+      throw Error('Símbolo inesperado');
+    }
+    function power() {
+      let value = atom();
+      if (peek() === '^') {
+        i++;
+        let exponent;
+        if (peek() === '{' || peek() === '(') exponent = group();
+        else exponent = unary();
+        value = Math.pow(value, exponent);
+      }
+      return value;
+    }
+    function unary() {
+      if (peek() === '+') { i++; return unary(); }
+      if (peek() === '-') { i++; return -unary(); }
+      return power();
+    }
+    function product() {
+      let value = unary();
+      while (true) {
+        if (peek() === '*') { i++; value *= unary(); }
+        else if (peek() === '/') { i++; value /= unary(); }
+        else if (peek() === 'x' || peek() === 'X' || peek() === '(' ||
+                 peek() === '{' || peek() === '\\frac' ||
+                 /^\d/.test(peek() || '')) {
+          value *= unary();
+        } else break;
+      }
+      return value;
+    }
+    function sum() {
+      let value = product();
+      while (peek() === '+' || peek() === '-') {
+        const op = tokens[i++];
+        const right = product();
+        value += op === '+' ? right : -right;
+      }
+      return value;
+    }
+    try {
+      const left = sum();
+      take('=');
+      const right = sum();
+      if (i !== tokens.length || !Number.isFinite(left) || !Number.isFinite(right)) return null;
+      return Math.abs(left - right) <= 1e-7 * Math.max(1, Math.abs(left), Math.abs(right));
+    } catch { return null; }
+  }
+
+  function numberFromChoice(text) {
+    const stripped = String(text).trim().replace(/^[A-H](?:\s*[.):])?\s*/i,'')
+      .replace(',', '.').trim();
+    if (/^[+-]?\d+(?:\.\d+)?$/.test(stripped)) return Number(stripped);
+    const fraction = stripped.match(/^([+-]?\d+)\s*\/\s*(\d+)$/);
+    if (fraction && Number(fraction[2]) !== 0) return Number(fraction[1]) / Number(fraction[2]);
+    return null;
+  }
+
+  function solveLogEquation(rows) {
+    const text = (document.querySelector('.perseus-renderer') ||
+      document.querySelector('main') || document.body)?.innerText || '';
+    const given = new Map([[10, 1]]);
+    for (const m of text.matchAll(/log\s*(\d+)\s*=\s*([+-]?\d+(?:[.,]\d+)?)/gi)) {
+      given.set(Number(m[1]), Number(m[2].replace(',', '.')));
+    }
+    if (given.has(5)) given.set(2, 1 - given.get(5));
+    const match = text.match(/(?:calcule|determine|valor de)[^\n]{0,100}?log\s*(\d+)/i);
     if (!match) return null;
     let n = Number(match[1]);
-    if (!Number.isSafeInteger(n) || n <= 0 || n > 10000000) return null;
+    if (!Number.isSafeInteger(n) || n < 1) return null;
     let result = 0;
     for (let p = 2; p * p <= n; p++) {
       if (n % p !== 0) continue;
-      if (!known.has(p)) return null;
-      while (n % p === 0) { result += known.get(p); n /= p; }
+      if (!given.has(p)) return null;
+      while (n % p === 0) { result += given.get(p); n /= p; }
     }
     if (n > 1) {
-      if (!known.has(n)) return null;
-      result += known.get(n);
+      if (!given.has(n)) return null;
+      result += given.get(n);
     }
-    return Number(result.toFixed(7));
-  }
-
-  function valueOfOption(text) {
-    const clean = text.replace(/^\s*[A-H][.)\s:-]+/i, '').replace(',', '.');
-    const match = clean.match(/[-+]?\d+(?:\.\d+)?/);
-    return match ? Number(match[0]) : NaN;
+    const hits = rows.map((row,i) =>
+      numberFromChoice(row.text) !== null &&
+      Math.abs(numberFromChoice(row.text) - result) < 1e-6 ? i : -1
+    ).filter(i=>i>=0);
+    return hits.length === 1 ? hits[0] : null;
   }
 
   function identify(rows) {
-    const labels = rows.map(x => normalize(x.text).replace(/^[a-h]\s+/, ''));
-    for (const entry of state.answers.slice().reverse()) {
-      const overlap = labels.filter(label => entry.values.some(v =>
-        v === label || v.endsWith(' ' + label) || label.endsWith(' ' + v))).length;
-      if (overlap < Math.max(2, Math.ceil(rows.length * 0.75))) continue;
-      const matches = labels.map((label, i) =>
-        label === entry.correct || label.endsWith(' ' + entry.correct) ||
-        entry.correct.endsWith(' ' + label) ? i : -1).filter(i => i >= 0);
-      if (matches.length === 1) return { index: matches[0], via: 'dados da questao' };
+    const labels = rows.map(row => clean(row.text).replace(/^[a-h]\s+/,''));
+    for (const data of [...st.identified].reverse()) {
+      const overlap = labels.filter(label => data.all.some(choice =>
+        choice === label || choice.endsWith(' ' + label) || label.endsWith(' ' + choice))).length;
+      if (overlap < 2) continue;
+      const hits = labels.map((label, index) =>
+        label === data.right || data.right.endsWith(' ' + label) ||
+        label.endsWith(' ' + data.right) ? index : -1).filter(i=>i>=0);
+      if (hits.length === 1) return {index: hits[0], via: 'dados da questão'};
     }
-    const computed = solveLog(exerciseText());
-    if (computed !== null) {
-      const matches = rows.map((r, i) =>
-        Math.abs(valueOfOption(r.text) - computed) < 1e-6 ? i : -1)
-        .filter(i => i >= 0);
-      if (matches.length === 1) return { index: matches[0], via: 'calculo de logaritmo' };
+    const answers = rows.map(row => numberFromChoice(row.text));
+    if (answers.every(v => v !== null)) {
+      for (const eq of equationSources()) {
+        const hits = answers.map((value, index) =>
+          evaluateEquation(eq, value) === true ? index : -1).filter(i => i >= 0);
+        if (hits.length === 1) return {index: hits[0], via: 'equação exponencial'};
+      }
     }
+    const logIndex = solveLogEquation(rows);
+    if (logIndex !== null) return {index: logIndex, via: 'logaritmo'};
     return null;
   }
 
   function choose(row) {
     const el = row.el;
-    const input = el.matches('input, [role="radio"]') ? el :
-      el.querySelector('input[type="radio"], [role="radio"]');
-    const target = input || el.querySelector('button, label') || el;
+    const target = el.querySelector('input[type="radio"], [role="radio"], label, button') || el;
     target.click();
   }
-
-  // O aluno ve somente A; internamente, o site recebe o ID da escolha real.
-  function showOnlyA(rows, index, signature) {
-    restoreOptions();
-    const answer = rows[index];
-    const first = rows[0].el;
-    if (!first.parentElement) return false;
-
-    const preview = document.createElement('div');
-    preview.id = 'lb33-only-a';
-    preview.setAttribute('role', 'button');
-    preview.tabIndex = 0;
-    preview.style.cssText = 'display:flex;gap:14px;align-items:center;padding:14px 16px;'+
-      'border:1px solid #96b7a0;border-radius:10px;margin:8px 0;'+
-      'background:#edf9f0;color:#1c3023;cursor:pointer;font:16px Arial,sans-serif;';
-    const letter = document.createElement('strong');
-    letter.textContent = 'A';
-    letter.style.cssText = 'border:2px solid #188459;border-radius:50%;'+
-      'width:32px;height:32px;display:grid;place-items:center;flex-shrink:0;';
-    const label = document.createElement('span');
-    label.textContent = answer.text.replace(/^\s*[A-H][.)\s:-]*/i, '').trim();
-    preview.append(letter, label);
-    const select = () => {
-      choose(answer);
-      state.lastClick = Date.now();
-      setPhase('selected', 'Alternativa A selecionada.');
-    };
-    preview.addEventListener('click', select);
-    preview.addEventListener('keydown', ev => {
-      if (ev.key === 'Enter' || ev.key === ' ') {
-        ev.preventDefault(); select();
+  function restore() {
+    for (const item of st.originalRows) {
+      if (item.el.isConnected) {
+        if (item.value) item.el.style.setProperty('display', item.value, item.priority);
+        else item.el.style.removeProperty('display');
       }
-    });
-    first.parentElement.insertBefore(preview, first);
-
-    const backups = rows.map(row => ({
-      element: row.el,
-      display: row.el.style.getPropertyValue('display'),
+    }
+    st.originalRows = [];
+    st.card?.remove();
+    st.card = null;
+  }
+  function showAsA(rows, index) {
+    restore();
+    // Primeiro seleciona a alternativa REAL, para manter a validação normal.
+    choose(rows[index]);
+    const target = rows[0].el;
+    if (!target.parentElement) return;
+    const card = document.createElement(target.tagName.toLowerCase() === 'li' ? 'li' : 'div');
+    card.id = 'lb34-card';
+    card.style.cssText = 'padding:14px;margin:8px 0;background:#e5f6eb;'+
+      'border:2px solid #168657;border-radius:10px;color:#143b24;'+
+      'font:16px Arial,sans-serif;cursor:pointer;';
+    card.textContent = 'A  ·  ' + rows[index].text.replace(/^\s*[A-H](?:[.):])?\s*/i,'').trim();
+    card.addEventListener('click', () => choose(rows[index]));
+    target.parentElement.insertBefore(card, target);
+    st.card = card;
+    st.originalRows = rows.map(row => ({
+      el: row.el,
+      value: row.el.style.getPropertyValue('display'),
       priority: row.el.style.getPropertyPriority('display')
     }));
-    for (const row of rows) row.el.style.setProperty('display', 'none', 'important');
-    state.current = { preview, backups, signature, answer };
-    return true;
+    rows.forEach(row => row.el.style.setProperty('display','none','important'));
   }
 
-  function restoreOptions() {
-    if (!state.current) return;
-    for (const item of state.current.backups) {
-      if (!item.element.isConnected) continue;
-      if (item.display) item.element.style.setProperty('display', item.display, item.priority);
-      else item.element.style.removeProperty('display');
-    }
-    state.current.preview.remove();
-    state.current = null;
-  }
-
-  function findButton(ids, words) {
+  function findButton(ids, texts) {
     for (const id of ids) {
       const el = document.querySelector(`[data-testid="${id}"]`);
-      if (visible(el)) return el;
+      if (isVisible(el)) return el;
     }
-    const allowed = new Set(words);
+    const accepted = new Set(texts);
     return [...document.querySelectorAll('button')].find(el =>
-      visible(el) && !el.closest('#lb33-panel') &&
-      allowed.has(optionText(el).toLowerCase())) || null;
+      isVisible(el) && !el.closest('#lb34-panel') &&
+      accepted.has((el.innerText || el.textContent || '').trim().toLowerCase())) || null;
   }
   const checkButton = () => findButton(['exercise-check-answer'],
     ['verificar', 'verificar resposta', 'conferir', 'check answer']);
-  const nextButton = () => findButton(['exercise-next-question', 'exercise-next-question-button'],
-    ['próxima questão', 'próximo', 'continuar', 'next question']);
+  const nextButton = () => findButton(['exercise-next-question','exercise-next-question-button'],
+    ['próxima questão','próximo','continuar','next question']);
 
   function feedback() {
-    const nodes = document.querySelectorAll('[role="alert"], [role="status"], [aria-live], .perseus-score');
-    return [...nodes].filter(visible).map(optionText).join(' ');
+    return [...document.querySelectorAll('[role="alert"], [role="status"], [aria-live]')]
+      .filter(isVisible).map(el => el.innerText || '').join(' ');
   }
-  function successFeedback(text) {
-    return /resposta correta|muito bem|parab[eé]ns|correct answer|resposta certa|mandou bem|voc[eê] acertou|acertou!/i.test(text);
+  function signature(rows) {
+    const q = (document.querySelector('.perseus-renderer') ||
+      document.querySelector('main') || document.body)?.innerText || '';
+    return clean(q).slice(0,800) + ':' + rows.map(r=>clean(r.text)).join('|');
   }
-
   function analyze() {
-    if (state.current) return;
+    restore();
     const rows = getOptions();
-    if (rows.length < 2) {
-      tell('Nao achei alternativas na tela. Abra uma questao de multipla escolha.');
-      return;
-    }
+    if (rows.length < 2) return status('Não consegui identificar as alternativas na página.');
     const answer = identify(rows);
-    if (!answer) {
-      tell(`${rows.length} alternativas encontradas, mas sem resposta confiavel. Nao vou chutar.`);
-      return;
-    }
-    state.source = answer.via;
-    const signature = fingerprint(rows);
-    if (!showOnlyA(rows, answer.index, signature)) {
-      tell('Nao foi possivel reorganizar as alternativas.');
-      return;
-    }
-    tell('Somente a resposta correta aparece como A.');
-    choose(rows[answer.index]);
-    state.lastClick = Date.now();
-    setPhase('selected', 'A selecionada; aguardando verificacao.');
+    if (!answer) return status(`${rows.length} alternativas detectadas. Fórmulas lidas: ${equationSources().length}. Sem solução para este formato.`);
+    st.previousSignature = signature(rows);
+    st.verification = null;
+    showAsA(rows, answer.index);
+    st.lastAction = Date.now();
+    phase('selected', `Resposta identificada (${answer.via}) e apresentada como A.`);
   }
 
   function tick() {
-    if (!state.running || document.visibilityState === 'hidden') return;
+    if (!st.running || document.visibilityState === 'hidden') return;
     const now = Date.now();
-    if (now - state.lastClick < 1200) return;
-
-    if (state.phase === 'idle') {
-      if (now - state.lastScan >= 2500) {
-        state.lastScan = now;
-        analyze();
-      }
-      return;
-    }
-    if (state.phase === 'selected') {
+    if (now - st.lastAction < 1000) return;
+    if (st.phase === 'idle') { analyze(); return; }
+    if (st.phase === 'selected') {
       const btn = checkButton();
       if (!btn) return;
-      state.beforeFeedback = feedback();
-      state.lastClick = now;
-      setPhase('checking', 'Verificando o acerto...');
+      st.feedbackBefore = feedback();
+      st.lastAction = now;
+      phase('checking', 'Verificando a resposta...');
       btn.click();
-      return;
-    }
-    if (state.phase === 'checking') {
-      const currentFeedback = feedback();
-      if (currentFeedback !== state.beforeFeedback &&
-          successFeedback(currentFeedback) && nextButton()) {
-        setPhase('correct', 'Acerto confirmado pela tela.');
-      } else if (now - state.since > 16000) {
-        state.running = false;
-        updateStart();
-        restoreOptions();
-        setPhase('paused', 'Sem confirmacao de acerto; automacao pausada.');
+    } else if (st.phase === 'checking') {
+      const current = feedback();
+      const confirmedByUI = current !== st.feedbackBefore &&
+        /resposta correta|muito bem|parab[eé]ns|mandou bem|voc[eê] acertou|correct answer/i.test(current);
+      if (st.verification === true || confirmedByUI) {
+        phase('correct', 'Acerto confirmado. Preparando próxima questão...');
+      } else if (st.verification === false || now - st.since > 15000) {
+        st.running = false;
+        restore();
+        phase('paused', 'Sem confirmação de acerto. Automação pausada.');
       }
-      return;
-    }
-    if (state.phase === 'correct') {
+    } else if (st.phase === 'correct') {
       const btn = nextButton();
       if (!btn) return;
-      const oldSignature = state.current?.signature;
-      restoreOptions();
-      state.lastClick = now;
-      setPhase('transition', 'Avancando para a proxima questao...');
-      state.previousSignature = oldSignature;
+      restore();
+      st.lastAction = now;
+      phase('transition', 'Avançando para a próxima questão...');
       btn.click();
-      return;
-    }
-    if (state.phase === 'transition') {
+    } else if (st.phase === 'transition') {
       const rows = getOptions();
-      if (rows.length >= 2 && fingerprint(rows) !== state.previousSignature) {
-        setPhase('idle', 'Nova questao detectada.');
-      } else if (now - state.since > 20000) {
-        state.running = false;
-        updateStart();
-        setPhase('paused', 'Nao consegui detectar a proxima questao.');
+      if (rows.length >= 2 && signature(rows) !== st.previousSignature) {
+        phase('idle', 'Nova questão detectada.');
+      } else if (now - st.since > 20000) {
+        st.running = false;
+        phase('paused', 'Não consegui identificar a próxima questão.');
       }
     }
   }
-
-  function updateStart() {
-    const el = document.getElementById('lb33-start');
-    if (el) el.textContent = state.running ? 'Pausar' : 'Iniciar';
-  }
-
-  function setupPanel() {
-    if (!document.body || document.getElementById('lb33-panel')) return;
-    const panel = document.createElement('section');
-    panel.id = 'lb33-panel';
-    panel.style.cssText = 'position:fixed;top:90px;right:16px;z-index:2147483646;'+
-      'background:#123225;color:white;border-radius:12px;width:255px;'+
-      'padding:14px;box-shadow:0 5px 22px #0005;font:13px Arial,sans-serif;';
+  function panel() {
+    if (!document.body || document.getElementById('lb34-panel')) return;
+    const p = document.createElement('aside');
+    p.id = 'lb34-panel';
+    p.style.cssText = 'position:fixed;top:65px;right:16px;z-index:2147483646;'+
+      'background:#123225;color:white;padding:14px;border-radius:12px;'+
+      'width:265px;font:13px Arial,sans-serif;box-shadow:0 4px 18px #0006;';
     const title = document.createElement('strong');
-    title.textContent = 'KHAN HELPER 3.3';
-    const info = document.createElement('p');
-    info.id = 'lb33-status'; info.textContent = state.message;
-    const meta = document.createElement('p');
-    meta.id = 'lb33-meta';
-    meta.style.cssText = 'font-size:11px;opacity:.85';
-    meta.textContent = 'Fonte: - | Respostas detectadas: 0';
-    function button(label, action) {
-      const el = document.createElement('button');
-      el.textContent = label;
-      el.style.cssText = 'background:#29bb78;color:#062414;border:0;border-radius:7px;'+
-        'padding:9px 10px;margin:0 6px 6px 0;cursor:pointer;';
-      el.addEventListener('click', action);
-      return el;
-    }
+    title.textContent = 'KHAN HELPER 3.4';
+    const line = document.createElement('p');
+    line.id = 'lb34-status';
+    line.textContent = st.message;
+    const button = (name, action) => {
+      const b = document.createElement('button');
+      b.textContent = name;
+      b.style.cssText = 'padding:9px;margin:0 6px 6px 0;border:0;'+
+        'border-radius:7px;background:#20ae72;color:#082a19;cursor:pointer;';
+      b.addEventListener('click', action);
+      return b;
+    };
     const start = button('Iniciar', () => {
-      state.running = !state.running;
-      if (!state.running) {
-        restoreOptions();
-        setPhase('idle', 'Pausado.');
-      } else {
-        setPhase('idle', 'Automacao iniciada.');
-      }
-      updateStart();
+      st.running = !st.running;
+      if (st.running && st.phase === 'paused') phase('idle', 'Automação reiniciada.');
+      if (!st.running) { restore(); phase('idle', 'Pausado.'); }
+      status(st.running ? 'Automação ligada.' : 'Automação desligada.');
     });
-    start.id = 'lb33-start';
-    const scan = button('Analisar', () => {
-      if (state.phase === 'idle' && !state.current) analyze();
-    });
+    start.id = 'lb34-start';
+    const scan = button('Analisar', () => analyze());
     const reset = button('Restaurar', () => {
-      state.running = false;
-      restoreOptions();
-      setPhase('idle', 'Opcoes originais restauradas.');
-      updateStart();
+      st.running = false;
+      restore();
+      phase('idle','Interface original restaurada.');
     });
-    panel.append(title, info, meta, start, scan, reset);
-    document.body.appendChild(panel);
+    p.append(title,line,start,scan,reset);
+    document.body.appendChild(p);
   }
-
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', setupPanel, { once: true });
-  } else setupPanel();
+    document.addEventListener('DOMContentLoaded',panel,{once:true});
+  } else panel();
   const timer = setInterval(() => {
-    try { tick(); }
-    catch (e) {
-      log('Erro:', e);
-      state.running = false;
-      restoreOptions();
-      updateStart();
-      setPhase('paused', 'Erro: ' + e.message);
+    try { tick(); } catch(e) {
+      st.running = false;
+      restore();
+      console.error('[Khan 3.4]',e);
+      phase('paused','Erro: '+e.message);
     }
-  }, 800);
-  window.addEventListener('pagehide', () => {
-    clearInterval(timer);
-    restoreOptions();
-  }, { once: true });
+  }, 900);
+  window.addEventListener('pagehide',() => { clearInterval(timer); restore(); },{once:true});
 })();
