@@ -86,70 +86,7 @@
         try {
           const question = JSON.parse(node.itemData)?.question;
           const widgets = question?.widgets || {};
-          for (const [key, widget] of O
- // ==UserScript==
- // @name         Khan Helper - LuisBulek 3.2
- // @namespace    https://github.com/luisbulek/khan
- // @version      3.2.0
- // @description  Detecta alternativas, resolve alguns logaritmos e so avanca apos acerto confirmado.
- // @match        https://*.khanacademy.org/*
- // @match        https://khanacademy.org/*
- // @run-at       document-start
- // @grant        none
- // ==/UserScript==
-
-(() => {
-  'use strict';
-  const KEY = '__LB_KHAN_32__';
-  if (window[KEY]) return;
-  window[KEY] = true;
-
-  const st = {
-    active: false,
-    phase: 'idle',
-    message: 'Analisando pagina...',
-    source: '',
-    answer: '',
-    answeredFingerprint: '',
-    since: Date.now(),
-    lastClick: 0,
-    lastAnalyze: 0,
-    captured: [],
-    network: 0
-  };
-
-  const log = (...v) => console.info('[Khan 3.2]', ...v);
-
-  const norm = s => String(s || '')
-    .replace(/\\(?:text|mathrm)\s*\{([^{}]*)\}/g, '$1')
-    .replace(/\*\*/g, '')
-    .replace(/\s+/g, ' ')
-    .replace(/[,]/g, '.')
-    .replace(/[^\p{L}\p{N}.+\-/%= ]/gu, '')
-    .trim()
-    .toLowerCase();
-
-  const visible = e => !!(
-    e &&
-    e.isConnected &&
-    e.getClientRects().length &&
-    !e.disabled &&
-    e.getAttribute('aria-disabled') !== 'true'
-  );
-
-  function status(message) {
-    if (st.message !== message) log(message);
-    st.message = message;
-
-    const el = document.getElementById('lb32-status');
-    if (el) el.textContent = message;
-
-    const meta = document.getElementById('lb32-meta');
-
-    if (meta) {
-      meta.textContent =
-        `Fonte: ${st.source || 'nenhuma'} · Dados: ${st.network}`;
-bject.entries(widgets)) {
+          for (const [key, widget] of Object.entries(widgets)) {
             if (widget?.type !== 'radio' || widget.options?.multipleSelect) continue;
             if (typeof question?.content === 'string' &&
                 !question.content.includes('☃ ' + key)) continue;
@@ -167,69 +104,6 @@ bject.entries(widgets)) {
       if (Array.isArray(node)) node.forEach(x => walk(x, depth + 1));
       else Object.values(node).forEach(x => walk(x, depth + 1));
     }
-
- // ==UserScript==
- // @name         Khan Helper - LuisBulek 3.2
- // @namespace    https://github.com/luisbulek/khan
- // @version      3.2.0
- // @description  Detecta alternativas, resolve alguns logaritmos e so avanca apos acerto confirmado.
- // @match        https://*.khanacademy.org/*
- // @match        https://khanacademy.org/*
- // @run-at       document-start
- // @grant        none
- // ==/UserScript==
-
-(() => {
-  'use strict';
-  const KEY = '__LB_KHAN_32__';
-  if (window[KEY]) return;
-  window[KEY] = true;
-
-  const st = {
-    active: false,
-    phase: 'idle',
-    message: 'Analisando pagina...',
-    source: '',
-    answer: '',
-    answeredFingerprint: '',
-    since: Date.now(),
-    lastClick: 0,
-    lastAnalyze: 0,
-    captured: [],
-    network: 0
-  };
-
-  const log = (...v) => console.info('[Khan 3.2]', ...v);
-
-  const norm = s => String(s || '')
-    .replace(/\\(?:text|mathrm)\s*\{([^{}]*)\}/g, '$1')
-    .replace(/\*\*/g, '')
-    .replace(/\s+/g, ' ')
-    .replace(/[,]/g, '.')
-    .replace(/[^\p{L}\p{N}.+\-/%= ]/gu, '')
-    .trim()
-    .toLowerCase();
-
-  const visible = e => !!(
-    e &&
-    e.isConnected &&
-    e.getClientRects().length &&
-    !e.disabled &&
-    e.getAttribute('aria-disabled') !== 'true'
-  );
-
-  function status(message) {
-    if (st.message !== message) log(message);
-    st.message = message;
-
-    const el = document.getElementById('lb32-status');
-    if (el) el.textContent = message;
-
-    const meta = document.getElementById('lb32-meta');
-
-    if (meta) {
-      meta.textContent =
-        `Fonte: ${st.source || 'nenhuma'} · Dados: ${st.network}`;
 
     walk(payload, 0);
     if (newlyFound.length) {
